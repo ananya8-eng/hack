@@ -1,8 +1,12 @@
 """
 Unified LLM client for agent orchestration.
 
-Provider order: NVIDIA → Grok → HuggingFace → Gemini.
-Each provider is skipped when unavailable or misconfigured.
+Provider order (cloud APIs only — Ollama is intentionally excluded):
+  NVIDIA → Grok → HuggingFace → Gemini.
+
+`generate()` uses the first provider that returns non-empty text.
+`generate_json()` walks the full chain when a provider returns text that
+does not parse as JSON (malformed JSON does not block fallback).
 """
 from __future__ import annotations
 
@@ -39,6 +43,60 @@ class LLMClient:
         self.gemini_model = settings.gemini_model
         self.default_timeout = settings.llm_default_timeout
 
+    def _provider_chain(
+        self,
+        prompt: str,
+        temperature: float,
+        timeout: int,
+    ) -> list[tuple[str, Callable[[], str]]]:
+        """
+        Ordered LLM providers. Ollama/local runtimes are not included — use cloud APIs only.
+        """
+        return [
+            ("nvidia", lambda: self._nvidia(prompt, temperature, timeout)),
+            ("grok", lambda: self._grok(prompt, temperature, timeout)),
+            (
+                "huggingface",
+                lambda: self._huggingface(prompt, temperature, timeout),
+            ),
+            ("gemini", lambda: self._gemini(prompt, temperature, timeout)),
+        ]
+
+    def _invoke_provider(
+        self,
+        provider_name: str,
+        prompt: str,
+        temperature: float,
+        timeout: int,
+    ) -> str:
+        dispatch: dict[str, Callable[[], str]] = {
+            "nvidia": lambda: self._nvidia(prompt, temperature, timeout),
+            "grok": lambda: self._grok(prompt, temperature, timeout),
+            "huggingface": lambda: self._huggingface(prompt, temperature, timeout),
+            "gemini": lambda: self._gemini(prompt, temperature, timeout),
+        }
+        fn = dispatch.get(provider_name)
+        if not fn:
+            return ""
+        try:
+            text = fn()
+            if text and text.strip():
+                logger.info("LLM response from provider: %s", provider_name)
+                return text.strip()
+        except Exception as exc:
+            logger.debug("LLM provider %s unavailable: %s", provider_name, exc)
+        return ""
+
+    def _call_provider(self, name: str, fn: Callable[[], str]) -> str:
+        try:
+            text = fn()
+            if text and text.strip():
+                logger.info("LLM response from provider: %s", name)
+                return text.strip()
+        except Exception as exc:
+            logger.debug("LLM provider %s unavailable: %s", name, exc)
+        return ""
+
     def generate(
         self,
         prompt: str,
@@ -46,23 +104,10 @@ class LLMClient:
         timeout: int | None = None,
     ) -> str:
         effective_timeout = timeout if timeout is not None else self.default_timeout
-        providers: list[tuple[str, Callable[[], str]]] = [
-            ("nvidia", lambda: self._nvidia(prompt, temperature, effective_timeout)),
-            ("grok", lambda: self._grok(prompt, temperature, effective_timeout)),
-            (
-                "huggingface",
-                lambda: self._huggingface(prompt, temperature, effective_timeout),
-            ),
-            ("gemini", lambda: self._gemini(prompt, temperature, effective_timeout)),
-        ]
-        for name, fn in providers:
-            try:
-                text = fn()
-                if text and text.strip():
-                    logger.info("LLM response from provider: %s", name)
-                    return text.strip()
-            except Exception as exc:
-                logger.debug("LLM provider %s unavailable: %s", name, exc)
+        for name, fn in self._provider_chain(prompt, temperature, effective_timeout):
+            text = self._call_provider(name, fn)
+            if text:
+                return text
         logger.warning("All LLM providers failed or returned empty")
         return ""
 
@@ -72,45 +117,70 @@ class LLMClient:
         *,
         temperature: float = 0.1,
         timeout: int | None = None,
-        max_attempts: int = 3,
+        max_attempts: int = 2,
         validator: Callable[[dict], bool] | None = None,
     ) -> Optional[dict]:
         """
-        Call the LLM and parse JSON, retrying when output is not valid JSON.
-        Appends strict JSON formatting instructions on every attempt.
+        Parse JSON from LLM output, walking the provider chain on failure.
+
+        For each provider (NVIDIA → Grok → HuggingFace → Gemini), retries up to
+        `max_attempts` times when the response is empty or not valid JSON, then
+        advances to the next provider. Ollama is not part of this chain.
         """
+        effective_timeout = timeout if timeout is not None else self.default_timeout
         base_prompt = prompt.rstrip()
         if "json.loads()" not in base_prompt:
             base_prompt = f"{base_prompt}{STRICT_JSON_SUFFIX}"
 
-        for attempt in range(1, max_attempts + 1):
-            attempt_prompt = base_prompt
-            if attempt > 1:
-                attempt_prompt = (
-                    f"{base_prompt}\n\n"
-                    f"[Retry {attempt}/{max_attempts}] Your previous reply was not valid JSON. "
-                    "Output ONLY a single JSON object. No markdown fences or extra text."
-                )
-
-            response_text = self.generate(
-                attempt_prompt,
-                temperature=temperature,
-                timeout=timeout,
-            )
-            parsed = parse_json_from_llm(response_text) if response_text else None
-            if parsed is not None and (validator is None or validator(parsed)):
+        provider_names = [name for name, _ in self._provider_chain(
+            base_prompt, temperature, effective_timeout
+        )]
+        for provider_idx, provider_name in enumerate(provider_names):
+            for attempt in range(1, max_attempts + 1):
+                attempt_prompt = base_prompt
                 if attempt > 1:
-                    logger.info("LLM returned parseable JSON on attempt %s", attempt)
-                return parsed
+                    attempt_prompt = (
+                        f"{base_prompt}\n\n"
+                        f"[Retry {attempt}/{max_attempts} on {provider_name}] "
+                        "Your previous reply was not valid JSON. "
+                        "Output ONLY a single JSON object. No markdown fences or extra text."
+                    )
 
-            if attempt < max_attempts:
+                response_text = self._invoke_provider(
+                    provider_name, attempt_prompt, temperature, effective_timeout
+                )
+                parsed = parse_json_from_llm(response_text) if response_text else None
+                if parsed is not None and (validator is None or validator(parsed)):
+                    if attempt > 1 or provider_idx > 0:
+                        logger.info(
+                            "LLM returned parseable JSON from %s (attempt %s)",
+                            provider_name,
+                            attempt,
+                        )
+                    return parsed
+
+                if attempt < max_attempts:
+                    logger.warning(
+                        "LLM JSON parse failed on %s (attempt %s/%s); retrying same provider",
+                        provider_name,
+                        attempt,
+                        max_attempts,
+                    )
+
+            if provider_idx < len(provider_names) - 1:
+                next_name = provider_names[provider_idx + 1]
                 logger.warning(
-                    "LLM JSON parse failed (attempt %s/%s); retrying",
-                    attempt,
+                    "Provider %s did not return valid JSON after %s attempt(s); "
+                    "falling back to %s",
+                    provider_name,
                     max_attempts,
+                    next_name,
                 )
 
-        logger.warning("LLM did not return valid JSON after %s attempts", max_attempts)
+        logger.warning(
+            "LLM did not return valid JSON after trying all cloud providers "
+            "(ollama excluded from chain)"
+        )
         return None
 
     def _openai_compatible_chat(

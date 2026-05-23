@@ -11,7 +11,9 @@ from backend.graph.langgraph_flow import run_financial_pipeline
 from backend.ingestion.pdf_extractor import extract_pdf_text
 from backend.tools.embedding_tool import embedding_manager
 from backend.logging_config import configure_logging
+from backend.rag.chat_comparison import run_chat_peer_comparison
 from backend.rag.retrieval import rag_chatbot
+from backend.tools.scrape_plan import is_comparison_query
 from backend.reports_store import REPORTS_DB, append_report_log
 
 configure_logging()
@@ -341,17 +343,35 @@ async def trigger_analysis(req: TriggerRequest, background_tasks: BackgroundTask
 @app.post("/api/chat")
 async def chatbot_query(req: ChatRequest):
     """
-    Conversational RAG Chatbot query endpoint. Matches query against report embeddings.
+    RAG chat: standard citation Q&A, or on-demand peer comparison (scrape → validate → SLM)
+    when the user asks to compare against a competitor in natural language.
     """
     report_id = req.report_id
     if report_id not in REPORTS_DB:
         raise HTTPException(status_code=404, detail="Report not found.")
-        
+
     report = REPORTS_DB[report_id]
     company = report["company_name"]
-    
-    # Ask chatbot
+    result = report.get("result") or {}
+    filing_excerpt = ""
+    sections = result.get("sections") or {}
+    if isinstance(sections, dict) and sections:
+        filing_excerpt = "\n".join(str(v) for v in sections.values() if v)[:8000]
+    else:
+        filing_excerpt = str(result.get("raw_text") or "")[:8000]
+
+    if is_comparison_query(req.message, filing_excerpt):
+        if not result:
+            raise HTTPException(
+                status_code=400,
+                detail="Report analysis is not ready yet. Wait for the pipeline to finish.",
+            )
+        comparison_res = run_chat_peer_comparison(report, req.message)
+        if comparison_res.get("handled"):
+            return comparison_res
+
     chatbot_res = rag_chatbot.query_chatbot(req.message, company)
+    chatbot_res["mode"] = "rag"
     return chatbot_res
 
 if __name__ == "__main__":

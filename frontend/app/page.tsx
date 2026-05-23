@@ -63,16 +63,12 @@ export default function Home() {
   const [chatMessages, setChatMessages] = useState<any[]>([]);
   const [chatInput, setChatInput] = useState<string>("");
   const [isChatLoading, setIsChatLoading] = useState<boolean>(false);
+  const [chatLoadingComparison, setChatLoadingComparison] = useState<boolean>(false);
   
   // Custom manual query trigger state
   const [retriggerQuery, setRetriggerQuery] = useState<string>("");
   const [isRetriggering, setIsRetriggering] = useState<boolean>(false);
 
-  // Dedicated company comparison state
-  const [compareInput, setCompareInput] = useState<string>("");
-  const [compareStatus, setCompareStatus] = useState<"idle" | "loading" | "done">("idle");
-  const [compareTarget, setCompareTarget] = useState<string>("");
-  
   // Dual-mode connector state (toggles automatically if backend is offline)
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
 
@@ -139,7 +135,7 @@ export default function Home() {
         setCurrentStep(fullReport.current_step || "Complete");
         setChatMessages([{
           id: 1, role: "assistant",
-          content: `Earnings narrative analysis for ${fullReport.company_name} is complete. Ask about MD&A tone, operational risks, supply chain, or peer comparisons.`,
+          content: `Earnings narrative analysis for ${fullReport.company_name} is complete. Ask about MD&A tone, operational risks, or supply chain. For peer benchmarks, ask in chat (e.g. "Compare ${fullReport.company_name} against AMD on gross margins and supply chain risks").`,
           citations: []
         }]);
       }
@@ -226,7 +222,6 @@ export default function Home() {
     setPipelineLogs(["Sending PDF to backend..."]);
     setCurrentStep("Uploading...");
     setActiveReport(null);
-    setCompareStatus("idle");
     try {
       const r = await fetch(apiUrl("/api/upload"), { method: "POST", body: formData });
       const body = await r.json().catch(() => ({}));
@@ -310,17 +305,32 @@ export default function Home() {
     }
   };
 
-  // Handle chatbot RAG messages
+  const isComparisonQuestion = (text: string) =>
+    /\b(compare|comparison|competitor|versus|vs\.?|against|benchmark|peer|prior year|previous year)\b/i.test(text);
+
+  // Handle chatbot RAG messages (peer comparison runs in-chat via scrape + SLM)
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!chatInput.trim() || !activeReportId) return;
     
     const userMsg = chatInput;
+    const comparisonMode = isComparisonQuestion(userMsg);
     setChatInput("");
     setIsChatLoading(true);
+    setChatLoadingComparison(comparisonMode);
     
     const newId = chatMessages.length + 1;
     setChatMessages(prev => [...prev, { id: newId, role: "user", content: userMsg }]);
+
+    if (comparisonMode) {
+      setChatMessages(prev => [...prev, {
+        id: `status-${newId}`,
+        role: "assistant",
+        content: "Fetching peer filing data and running comparative analysis…",
+        citations: [],
+        isStatus: true
+      }]);
+    }
 
     try {
       const res = await fetch(apiUrl("/api/chat"), {
@@ -334,17 +344,42 @@ export default function Home() {
       
       if (res.ok) {
         const data = await res.json();
-        setChatMessages(prev => [...prev, {
+        setChatMessages(prev => {
+          const withoutStatus = comparisonMode
+            ? prev.filter(m => !m.isStatus)
+            : prev;
+          return [...withoutStatus, {
+            id: newId + 1,
+            role: "assistant",
+            content: data.answer,
+            citations: data.citations || [],
+            mode: data.mode,
+            comparison: data.comparison || null
+          }];
+        });
+      } else {
+        const errBody = await res.json().catch(() => ({}));
+        const detail = typeof errBody.detail === "string"
+          ? errBody.detail
+          : "Chat request failed.";
+        setChatMessages(prev => [...prev.filter(m => !m.isStatus), {
           id: newId + 1,
           role: "assistant",
-          content: data.answer,
-          citations: data.citations || []
+          content: detail,
+          citations: []
         }]);
       }
     } catch (err) {
       console.error("Chat API error:", err);
+      setChatMessages(prev => [...prev.filter(m => !m.isStatus), {
+        id: newId + 1,
+        role: "assistant",
+        content: "Could not reach the chat API. Is the backend running?",
+        citations: []
+      }]);
     } finally {
       setIsChatLoading(false);
+      setChatLoadingComparison(false);
     }
   };
 
@@ -521,7 +556,7 @@ export default function Home() {
         <section className="col-span-12 xl:col-span-3 flex flex-col gap-6 h-[calc(100vh-140px)]">
           
           {/* 1. Ingestion Agentic Pipeline Status Visualizer */}
-          <div className="glass-panel p-4 flex flex-col h-[40%] overflow-hidden relative border-indigo-900/40">
+          <div className="glass-panel p-4 flex flex-col h-[35%] overflow-hidden relative border-indigo-900/40">
             <div className="absolute top-2 right-2 flex items-center gap-1.5">
               <span className="w-2 h-2 rounded-full bg-indigo-500 animate-ping" />
               <span className="text-[10px] text-indigo-400 font-medium">LangGraph Flow</span>
@@ -580,12 +615,15 @@ export default function Home() {
             )}
           </div>
 
-          {/* 2. RAG CITATION-BACKED CHATBOT PANEL */}
-          <div className="glass-panel p-4 flex flex-col h-[60%] overflow-hidden border-indigo-900/40">
-            <h2 className="text-xs font-semibold tracking-wider text-indigo-300/80 mb-3 uppercase flex items-center gap-2">
+          {/* 2. RAG chat + in-chat peer comparison */}
+          <div className="glass-panel p-4 flex flex-col h-[65%] overflow-hidden border-indigo-900/40">
+            <h2 className="text-xs font-semibold tracking-wider text-indigo-300/80 mb-1 uppercase flex items-center gap-2">
               <Bot className="w-4 h-4 text-indigo-400" />
-              CITATION-BACKED CHATBOT
+              RAG CHAT &amp; PEER COMPARISON
             </h2>
+            <p className="text-[10px] text-slate-500 mb-3">
+              Ask filing questions or compare peers in chat (e.g. &quot;Compare against AMD on margins&quot;).
+            </p>
 
             {/* Chat message threads */}
             <div className="flex-1 overflow-y-auto space-y-4 mb-3 p-1">
@@ -598,12 +636,38 @@ export default function Home() {
                 chatMessages.map(msg => (
                   <div key={msg.id} className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}>
                     <span className="text-[9px] text-slate-500 mb-1 px-1">{msg.role === "user" ? "User" : "Aegis RAG AI"}</span>
-                    <div className={`p-3 rounded-lg text-xs leading-relaxed max-w-[90%] ${
+                    <div className={`p-3 rounded-lg text-xs leading-relaxed max-w-[90%] whitespace-pre-wrap ${
                       msg.role === "user" 
                         ? "bg-indigo-600 text-white rounded-br-none" 
+                        : msg.isStatus
+                        ? "bg-purple-950/30 text-purple-200 border border-purple-800/40 rounded-bl-none italic"
+                        : msg.mode === "comparison"
+                        ? "bg-purple-950/25 text-slate-200 border border-purple-900/40 rounded-bl-none"
                         : "bg-indigo-950/40 text-slate-200 border border-indigo-900/30 rounded-bl-none"
                     }`}>
                       {msg.content}
+
+                      {msg.mode === "comparison" && msg.comparison?.competitor_benchmarks?.length > 0 && (
+                        <div className="mt-3 pt-2 border-t border-purple-900/40">
+                          <span className="text-[9px] text-purple-300 font-semibold uppercase block mb-1.5">Benchmark table</span>
+                          <table className="w-full text-[10px] font-mono">
+                            <thead>
+                              <tr className="text-purple-400 text-[8px] uppercase border-b border-purple-950/50">
+                                <th className="pb-1 text-left">Metric</th>
+                                <th className="pb-1 text-right">vs Peer</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-purple-950/30 text-slate-300">
+                              {msg.comparison.competitor_benchmarks.map((bm: any, bIdx: number) => (
+                                <tr key={bIdx}>
+                                  <td className="py-1 pr-2">{bm.metric_name}</td>
+                                  <td className="py-1 text-right text-purple-300">{bm.comparison_value}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
                       
                       {/* Interactive Citations list inside assistant messages */}
                       {msg.citations && msg.citations.length > 0 && (
@@ -632,7 +696,11 @@ export default function Home() {
                   <span className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce" />
                   <span className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce [animation-delay:0.2s]" />
                   <span className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce [animation-delay:0.4s]" />
-                  <span>RAG Engine searching vector store...</span>
+                  <span>
+                    {chatLoadingComparison
+                      ? "Scraping peer filings and running SLM comparison..."
+                      : "RAG engine searching vector store..."}
+                  </span>
                 </div>
               )}
               <div ref={chatEndRef} />
@@ -642,7 +710,7 @@ export default function Home() {
             <form onSubmit={handleSendMessage} className="flex gap-2">
               <input
                 type="text"
-                placeholder={activeReportId ? "Ask a RAG audit query..." : "Load a report first..."}
+                placeholder={activeReportId ? "Ask about risks, or compare vs AMD, Intel..." : "Load a report first..."}
                 value={chatInput}
                 onChange={e => setChatInput(e.target.value)}
                 disabled={!activeReportId || isChatLoading}
@@ -811,7 +879,7 @@ export default function Home() {
         <section className="col-span-12 xl:col-span-4 flex flex-col gap-6 h-[calc(100vh-140px)]">
           
           {/* 1. Interactive Risk Audit Card Grid */}
-          <div className="glass-panel p-5 flex flex-col h-[55%] overflow-hidden border-indigo-900/40">
+          <div className="glass-panel p-5 flex flex-col flex-1 overflow-hidden border-indigo-900/40">
             <h2 className="text-xs font-semibold tracking-wider text-indigo-300/80 mb-3 uppercase flex items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-indigo-400" />
               OPERATIONAL RISK AUDIT
@@ -872,164 +940,6 @@ export default function Home() {
                 })
               )}
             </div>
-          </div>
-
-          {/* 2. Compare With Company Panel */}
-          <div className="glass-panel flex flex-col h-[45%] overflow-hidden border-indigo-900/40 relative">
-            {/* Header */}
-            <div className="px-5 pt-4 pb-3 border-b border-indigo-950/40">
-              <h2 className="text-xs font-semibold tracking-wider text-indigo-300/80 uppercase flex items-center gap-2">
-                <Layers className="w-4 h-4 text-indigo-400" />
-                PEER BENCHMARKING
-              </h2>
-              <p className="text-[10px] text-slate-500 mt-0.5">Compare the loaded filing against any company</p>
-            </div>
-
-            {!activeReport ? (
-              <div className="flex-1 flex flex-col items-center justify-center text-center px-6">
-                <Layers className="w-10 h-10 text-indigo-950 mb-2" />
-                <p className="text-xs text-slate-400">Load a filing first to enable peer comparison.</p>
-              </div>
-            ) : (
-              <div className="flex-1 flex flex-col overflow-hidden">
-
-                {/* ── COMPARE INPUT SECTION ── */}
-                <div className="px-4 pt-3 pb-3 border-b border-indigo-950/30 space-y-2">
-                  {/* Quick-select company chips */}
-                  <div className="flex flex-wrap gap-1.5">
-                    {["AMD", "Intel", "Tesla", "Apple", "Microsoft", "Google"].map(co => (
-                      <button
-                        key={co}
-                        onClick={() => setCompareInput(co)}
-                        disabled={compareStatus === "loading"}
-                        className={`text-[10px] font-semibold px-2.5 py-1 rounded-full border transition active:scale-95 disabled:opacity-40 ${
-                          compareInput === co
-                            ? "bg-purple-600 border-purple-400 text-white"
-                            : "bg-indigo-950/40 border-indigo-800/40 text-indigo-300 hover:border-purple-500 hover:text-white"
-                        }`}
-                      >
-                        {co}
-                      </button>
-                    ))}
-                  </div>
-
-                  {/* Free-text input + Compare button */}
-                  <form
-                    onSubmit={async (e) => {
-                      e.preventDefault();
-                      const company = compareInput.trim();
-                      if (!company || !activeReportId) return;
-                      setCompareStatus("loading");
-                      setCompareTarget(company);
-                      try {
-                        const res = await fetch(apiUrl("/api/reports/trigger"), {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({
-                            report_id: activeReportId,
-                            query: `Compare ${activeReport?.company_name ?? ""} against ${company}. Benchmark supply chain risks, gross margins, sentiment differences, and management tone vs ${company}.`
-                          })
-                        });
-                        if (!res.ok) throw new Error("Trigger failed");
-                        await pollUntilComplete(activeReportId);
-                        await selectReport(activeReportId, activeReport?.company_name ?? "");
-                        setCompareStatus("done");
-                      } catch (err) {
-                        console.error("Compare error:", err);
-                        setCompareStatus("idle");
-                      }
-                    }}
-                    className="flex gap-2"
-                  >
-                    <input
-                      type="text"
-                      placeholder="Type a company name (e.g. Qualcomm, TSMC, Samsung...)" 
-                      value={compareInput}
-                      onChange={e => setCompareInput(e.target.value)}
-                      disabled={compareStatus === "loading"}
-                      className="flex-1 bg-slate-950/80 border border-purple-950/60 rounded-lg px-3 py-2 text-[10px] text-white placeholder-slate-500 focus:outline-none focus:border-purple-500 glow-focus transition disabled:opacity-50"
-                    />
-                    <button
-                      type="submit"
-                      disabled={compareStatus === "loading" || !compareInput.trim() || !activeReportId}
-                      className="text-[10px] font-bold px-3 py-2 rounded-lg bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white transition disabled:opacity-50 flex items-center gap-1.5 shrink-0"
-                    >
-                      {compareStatus === "loading" ? (
-                        <><Cpu className="w-3 h-3 animate-spin" /> Comparing...</>
-                      ) : (
-                        <><Activity className="w-3 h-3" /> COMPARE</>
-                      )}
-                    </button>
-                  </form>
-
-                  {/* Status feedback */}
-                  {compareStatus === "loading" && (
-                    <div className="text-[10px] text-amber-400 flex items-center gap-1.5 animate-pulse">
-                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
-                      Running LangGraph comparison against <strong>{compareTarget}</strong>...
-                    </div>
-                  )}
-                  {compareStatus === "done" && (
-                    <div className="text-[10px] text-emerald-400 flex items-center gap-1.5">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                      Comparison with <strong>{compareTarget}</strong> complete — results below ↓
-                    </div>
-                  )}
-                </div>
-
-                {/* ── RESULTS SECTION ── */}
-                <div className="flex-1 overflow-y-auto px-4 pt-2 pb-3 space-y-2">
-
-                  {/* Competitor Benchmarks table */}
-                  {(activeReport.result?.final_comparative_analysis?.competitor_benchmarks ?? []).length > 0 && (
-                    <div className="bg-slate-950/40 rounded-lg border border-slate-900/50 p-2">
-                      <span className="text-[9px] text-indigo-400 font-semibold uppercase block tracking-wider mb-1.5">Metric Benchmarks</span>
-                      <table className="w-full text-[10px] font-mono text-left">
-                        <thead>
-                          <tr className="border-b border-indigo-950/50 text-indigo-400 uppercase text-[8px] tracking-wider">
-                            <th className="pb-1">Metric</th>
-                            <th className="pb-1 text-center">{activeReport.company_name}</th>
-                            <th className="pb-1 text-right">vs Peer</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-indigo-950/30 text-slate-300">
-                          {activeReport.result.final_comparative_analysis.competitor_benchmarks.map((bm: any, bIdx: number) => (
-                            <tr key={bIdx} className="hover:bg-indigo-950/20">
-                              <td className="py-1.5 pr-2 font-semibold text-[9px]">{bm.metric_name}</td>
-                              <td className="py-1.5 text-center text-indigo-300 text-[9px]">{bm.target_company}</td>
-                              <td className="py-1.5 text-right text-purple-300 text-[9px]">{bm.comparison_value}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-
-                  {/* Tone Shifts */}
-                  {(activeReport.result?.final_comparative_analysis?.tone_shifts ?? []).length > 0 && (
-                    <div className="bg-slate-950/40 rounded-lg border border-slate-900/50 p-2 space-y-1.5">
-                      <span className="text-[9px] text-purple-400 font-semibold uppercase block tracking-wider">Management Tone Shifts</span>
-                      {activeReport.result.final_comparative_analysis.tone_shifts.map((ts: any, tIdx: number) => (
-                        <div key={tIdx} className="border-l-2 border-purple-500 pl-2 py-0.5 leading-snug">
-                          <strong className="text-white text-[9px]">{ts.comparison_target} — {ts.shift_direction}:</strong>{" "}
-                          <span className="text-slate-400 text-[9px]">{ts.details}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Empty state */}
-                  {(activeReport.result?.final_comparative_analysis?.competitor_benchmarks ?? []).length === 0 &&
-                   (activeReport.result?.final_comparative_analysis?.tone_shifts ?? []).length === 0 && (
-                    <div className="flex flex-col items-center justify-center py-4 text-center">
-                      <Layers className="w-8 h-8 text-indigo-950 mb-2" />
-                      <p className="text-[10px] text-slate-500">Select or type a company above and click <strong className="text-purple-400">COMPARE</strong> to generate benchmarks.</p>
-                    </div>
-                  )}
-                </div>
-
-              </div>
-            )}
           </div>
         </section>
 

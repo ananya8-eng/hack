@@ -28,6 +28,57 @@ def _needs_external_context(user_query: str, text: str) -> bool:
     return any(w in query_lower or w in text_lower for w in COMPARE_KEYWORDS)
 
 
+def is_comparison_query(user_query: str, filing_text: str = "") -> bool:
+    """True when the user message should trigger peer scrape + comparative SLM."""
+    return _needs_external_context(user_query, filing_text)
+
+
+def extract_peer_companies(user_query: str, base_company: str) -> List[str]:
+    """
+    Pull explicit peer company names from natural-language comparison questions.
+    """
+    if not user_query:
+        return []
+
+    base_norm = re.sub(r"[^a-z0-9]", "", (base_company or "").lower())
+    peers: List[str] = []
+    seen: set[str] = set()
+
+    patterns = [
+        re.compile(
+            r"(?:compare|benchmark|versus|vs\.?|against)\s+(?:\w+\s+){0,6}"
+            r"(?:with|against|to|versus|vs\.?)\s+([A-Za-z][A-Za-z0-9&.\-\s]{1,40})",
+            re.I,
+        ),
+        re.compile(
+            r"(?:compare|benchmark)\s+([A-Za-z][A-Za-z0-9&.\-\s]{1,40})\s+"
+            r"(?:with|against|to|versus|vs\.?)\s+([A-Za-z][A-Za-z0-9&.\-\s]{1,40})",
+            re.I,
+        ),
+        re.compile(r"(?:peer|competitor|rival)\s+([A-Za-z][A-Za-z0-9&.\-\s]{1,40})", re.I),
+    ]
+
+    for pattern in patterns:
+        for match in pattern.finditer(user_query):
+            for group in match.groups():
+                if not group:
+                    continue
+                name = re.split(
+                    r"\s+(?:on|for|using|from|in|and|or|with|about)\s+",
+                    group.strip(),
+                    maxsplit=1,
+                )[0].strip(" .,;:")
+                if len(name) < 2:
+                    continue
+                norm = re.sub(r"[^a-z0-9]", "", name.lower())
+                if not norm or norm == base_norm or norm in seen:
+                    continue
+                seen.add(norm)
+                peers.append(name.title())
+
+    return peers[:3]
+
+
 def _coerce_request(raw: Any, company_name: str) -> Dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -126,6 +177,32 @@ def build_heuristic_scrape_requests(
                 "purpose": "Prior-period SEC filing",
             }
         )
+
+    for peer in extract_peer_companies(user_query, company_name):
+        requests.append(
+            {
+                "type": "sec_filing",
+                "query": "",
+                "company": peer,
+                "filing_type": "10-K",
+                "purpose": f"SEC filing for peer benchmark: {peer}",
+            }
+        )
+
+    # De-duplicate by type+company+query
+    deduped: List[Dict[str, Any]] = []
+    seen_keys: set[tuple] = set()
+    for req in requests:
+        key = (
+            req.get("type"),
+            str(req.get("company", "")).upper(),
+            str(req.get("query", "")).lower()[:80],
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(req)
+    requests = deduped
 
     reason = "External enrichment required for comparison or peer context."
     return {
