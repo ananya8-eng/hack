@@ -1,0 +1,340 @@
+# End-to-End Business-Grade RAG Implementation for Financial Intelligence Platform
+
+## Problem Statement
+
+The current RAG system in [retrieval.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/retrieval.py) is a basic prototype with significant gaps:
+
+1. **Mock embeddings** — `USE_MOCK_EMBEDDINGS=true` is hardcoded in [main.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/main.py#L10), meaning no real semantic search happens
+2. **No re-ranking** — Retrieved chunks are used as-is with no relevance scoring refinement
+3. **No conversation memory** — Each query is independent; no multi-turn context
+4. **Fragile citation extraction** — Heuristic keyword matching produces low-quality citations
+5. **No hallucination guardrails** — The system doesn't validate LLM answers against source chunks
+6. **Single-collection flat store** — All filings dumped into one "filings" collection with no multi-tenant isolation
+7. **No hybrid search** — Only vector similarity; no keyword/BM25 component
+8. **No document-scoped queries** — Chatbot doesn't properly scope queries to the active report's documents
+9. **No streaming** — Entire response generated before sending to frontend
+
+## Existing Code Audit
+
+| File | Status | Key Issues |
+|------|--------|------------|
+| [chunking.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/chunking.py) | Basic but functional | No metadata-aware chunking, no section-boundary respect |
+| [retrieval.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/retrieval.py) | Needs major overhaul | Heuristic fallback is brittle, no re-ranking, no conversation memory |
+| [chroma_tool.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/tools/chroma_tool.py) | Works but limited | No collection-per-report, no metadata filtering by filing_date/section |
+| [embedding_tool.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/tools/embedding_tool.py) | Mock by default | Real BAAI/bge model never loads in current config |
+| [langgraph_flow.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/graph/langgraph_flow.py) | Good structure | Chunking node works but doesn't pass rich metadata |
+| [main.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/main.py) | Functional | Chat endpoint is basic; no streaming, no conversation history |
+
+---
+
+## Proposed Changes — 5 Phases
+
+Each phase is independently testable and buildable. You validate one before proceeding to the next.
+
+---
+
+## Phase 1 — Embedding Pipeline Hardening & Smart Chunking
+
+**Goal**: Make the vector store actually useful with real embeddings and metadata-rich chunks.
+
+### [MODIFY] [embedding_tool.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/tools/embedding_tool.py)
+- Remove `USE_MOCK_EMBEDDINGS` default override
+- Add a `USE_REAL_EMBEDDINGS` mode that lazy-loads `BAAI/bge-large-en-v1.5` on first call
+- Add embedding cache (LRU) to avoid re-encoding identical chunks
+- Add batch encoding method `get_embeddings(texts: list)` for bulk indexing performance
+- Keep mock fallback but make it opt-in, not opt-out
+
+### [MODIFY] [chunking.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/chunking.py)
+- Add **section-aware chunking**: respect section boundaries so chunks don't span Risk Factors into MD&A
+- Add **metadata-enriched chunking**: each chunk returns `{text, metadata}` where metadata includes `section_name`, `chunk_index`, `char_start`, `char_end`, `filing_company`, `filing_type`
+- Add **overlap sentence deduplication**: when chunks overlap, detect and tag duplicate sentences
+- Add **parent-child chunking**: store both a larger "parent" chunk (1400 chars) and smaller "child" chunks (700 chars) — retrieve child, expand to parent for context
+
+### [MODIFY] [chroma_tool.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/tools/chroma_tool.py)
+- Support **collection-per-report** via `get_or_create_collection(report_id)` — isolates document namespaces
+- Add `add_chunks_batch()` that accepts pre-computed embeddings for bulk performance
+- Add richer metadata schema: `company`, `section`, `chunk_index`, `parent_chunk_id`, `filing_date`, `filing_type`
+- Add `delete_collection(report_id)` for cleanup
+- Keep the global "filings" collection as a cross-report search index
+
+### [MODIFY] [langgraph_flow.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/graph/langgraph_flow.py) (node_ingest_and_chunk)
+- Pass enriched metadata from section extractor through to ChromaDB
+- Store chunks in both report-scoped collection and global collection
+- Track `report_id` in AgentState
+
+### [MODIFY] [main.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/main.py)
+- Remove `os.environ.setdefault("USE_MOCK_EMBEDDINGS", "true")` — let config determine embedding mode
+- Add environment variable `EMBEDDING_MODE=real|mock` with `mock` as default for fast dev, `real` for production
+
+### Validation Checkpoint — Phase 1
+```
+1. Upload a real 10-K PDF (e.g., NVIDIA)
+2. Verify chunks are created with correct metadata (section, company, index)
+3. Query ChromaDB directly and verify similarity scores are meaningful (not random)
+4. Confirm parent-child chunk linkage works
+5. Run: python -c "from backend.tools.embedding_tool import embedding_manager; print(len(embedding_manager.get_embedding('test')))"
+   → Should return 1024 (real) or 1024 (mock) based on config
+```
+
+---
+
+## Phase 2 — Intelligent Retrieval with Re-Ranking & Hybrid Search
+
+**Goal**: Dramatically improve retrieval quality so the RAG system returns the *right* chunks.
+
+### [NEW] [backend/rag/reranker.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/reranker.py)
+- Implement a **cross-encoder re-ranker** using `cross-encoder/ms-marco-MiniLM-L-6-v2` (lightweight, fast)
+- Takes query + candidate chunks → re-scores and re-orders by relevance
+- Fallback: keyword overlap scoring (TF-IDF style) if cross-encoder isn't available
+- Returns top-K re-ranked results with confidence scores
+
+### [NEW] [backend/rag/hybrid_search.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/hybrid_search.py)
+- Implement **hybrid search** combining:
+  - **Semantic search** (ChromaDB vector similarity) — captures meaning
+  - **Keyword search** (BM25 via `rank_bm25`) — captures exact terms like ticker symbols, financial terms
+- **Reciprocal Rank Fusion (RRF)** to merge results from both sources
+- Configurable weight: `alpha` parameter (0.0 = pure keyword, 1.0 = pure semantic)
+
+### [NEW] [backend/rag/query_router.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/query_router.py)
+- **Query classification**: determine if a query is:
+  - `factual` → "What is NVIDIA's gross margin?" → heavier keyword weight
+  - `analytical` → "How does supply chain risk affect NVIDIA?" → heavier semantic weight
+  - `comparative` → "Compare NVIDIA vs AMD risks" → multi-document retrieval
+  - `temporal` → "How did risks change from last year?" → metadata date filtering
+- Route to appropriate retrieval strategy
+
+### [MODIFY] [retrieval.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/retrieval.py)
+- Replace direct ChromaDB query with `HybridSearchEngine` → `ReRanker` pipeline
+- Use `QueryRouter` to adapt retrieval strategy per query type
+- Increase initial retrieval to top-20, then re-rank down to top-5
+- Add **Maximal Marginal Relevance (MMR)** to reduce redundancy in retrieved chunks
+- Add metadata filters: scope by `company`, `section`, `filing_date`
+
+### Validation Checkpoint — Phase 2
+```
+1. Upload NVIDIA 10-K, then ask: "What is NVIDIA's gross margin?"
+   → Should return chunks from MD&A with exact numbers, not vague risk text
+2. Ask: "How does supply chain risk affect operations?"
+   → Should return Risk Factors chunks about TSMC/CoWoS, not MD&A revenue numbers
+3. Ask: "Compare NVIDIA and AMD risk factors"
+   → Should retrieve chunks from BOTH companies (if AMD filing is indexed)
+4. Verify re-ranked results have higher relevance than raw ChromaDB results
+5. Check MMR prevents returning 3 chunks saying the same thing about TSMC
+```
+
+---
+
+## Phase 3 — Context-Aware Prompt Engineering & Conversation Memory
+
+**Goal**: Make the chatbot actually conversational with proper multi-turn memory and financial-domain prompts.
+
+### [NEW] [backend/rag/conversation_memory.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/conversation_memory.py)
+- In-memory conversation store keyed by `report_id` + `session_id`
+- Stores last N turns (configurable, default 10)
+- Each turn: `{role, content, timestamp, citations_used}`
+- **Context compression**: summarize older turns to keep prompt within token limits
+- **Coreference resolution helper**: detect pronouns ("it", "they", "the company") and resolve to entities from prior turns
+
+### [NEW] [backend/rag/prompt_templates.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/prompt_templates.py)
+- Structured prompt templates for different query types:
+  - `FINANCIAL_RAG_SYSTEM_PROMPT` — main system identity with strict citation rules
+  - `FACTUAL_ANSWER_TEMPLATE` — for number/fact queries
+  - `ANALYTICAL_ANSWER_TEMPLATE` — for reasoning queries
+  - `COMPARATIVE_ANSWER_TEMPLATE` — for cross-company queries
+  - `INSUFFICIENT_CONTEXT_TEMPLATE` — when chunks don't contain enough info
+- All templates enforce:
+  - Inline citations in format `[Company Section - Chunk N]`
+  - "I cannot find sufficient evidence" when context lacks answer
+  - No speculation beyond retrieved chunks
+
+### [MODIFY] [retrieval.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/retrieval.py)
+- `RAGChatbot.query_chatbot()` now accepts `session_id` and `conversation_history`
+- Augment user query with conversation context before retrieval (contextual retrieval)
+- Select prompt template based on `QueryRouter` classification
+- Inject conversation summary into prompt for multi-turn coherence
+- Add query reformulation: expand ambiguous queries using conversation context
+
+### [MODIFY] [main.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/main.py)
+- Update `/api/chat` to accept `session_id` (optional, auto-generated if missing)
+- Store and retrieve conversation history per session
+- Return `session_id` in response for frontend to maintain
+
+### Validation Checkpoint — Phase 3
+```
+1. Ask: "What risks does NVIDIA face?"
+   → Get answer with citations
+2. Follow up: "Which of those is the most severe?"
+   → System should understand "those" refers to NVIDIA's risks from turn 1
+3. Follow up: "How does AMD compare on that risk?"
+   → System should understand "that risk" = the most severe one from turn 2
+4. Ask 12 questions in sequence — verify older context is compressed, not lost
+5. Start a new session — verify it starts fresh (no bleed from prior session)
+```
+
+---
+
+## Phase 4 — Citation Verification, Hallucination Guardrails & Answer Quality
+
+**Goal**: Ensure every statement in a RAG answer is traceable to source chunks, and reject hallucinated content.
+
+### [NEW] [backend/rag/citation_verifier.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/citation_verifier.py)
+- **Post-generation citation audit**:
+  - Parse all `[Citation ID]` references in the generated answer
+  - For each citation, verify the claim exists in the corresponding source chunk
+  - Use lightweight NLI (Natural Language Inference) or string matching to validate
+  - Flag `unverified_claims` in the response
+- **Citation completeness check**: if the answer makes a factual claim without a citation, flag it
+- **Source traceability**: map each citation back to `(document_name, page_number, section, char_range)`
+
+### [NEW] [backend/rag/hallucination_guard.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/hallucination_guard.py)
+- **Faithfulness score**: compare generated answer against source chunks using:
+  - Sentence-level entailment checking
+  - Named entity consistency (numbers, dates, company names must match source)
+  - Contradiction detection
+- **Confidence scoring**: assign a `confidence` score (0.0–1.0) to the overall answer
+- **Auto-fallback**: if confidence < 0.5, trigger the heuristic RAG fallback or return "insufficient evidence"
+- **Guardrail rules**:
+  - Reject answers that mention companies/data not in retrieved chunks
+  - Reject answers with fabricated numbers not in source text
+  - Reject answers that contradict source text
+
+### [NEW] [backend/rag/answer_formatter.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/answer_formatter.py)
+- Format final answer into structured response:
+  ```json
+  {
+    "answer": "...",
+    "citations": [...],
+    "confidence_score": 0.85,
+    "query_type": "analytical",
+    "sources_used": 4,
+    "unverified_claims": [],
+    "conversation_context_used": true,
+    "retrieval_metadata": {
+      "chunks_retrieved": 20,
+      "chunks_after_rerank": 5,
+      "search_strategy": "hybrid",
+      "mmr_applied": true
+    }
+  }
+  ```
+
+### [MODIFY] [retrieval.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/retrieval.py)
+- Wire up the full pipeline: `Retrieve → ReRank → Prompt → Generate → Verify → Format`
+- Add fallback chain: LLM answer → citation verification → hallucination guard → heuristic fallback
+- Return structured response with quality metadata
+
+### Validation Checkpoint — Phase 4
+```
+1. Ask a question where the answer IS in the chunks
+   → Verify confidence > 0.7, all citations verified
+2. Ask a question where the answer is NOT in the chunks
+   → Verify system says "I cannot find sufficient evidence" (not hallucination)
+3. Manually inject a bad LLM response with made-up numbers
+   → Verify hallucination_guard catches it and falls back
+4. Ask about a company not in the database
+   → Verify system doesn't make up filing data
+5. Check citation_verifier output: every [Citation] should map to a real chunk
+```
+
+---
+
+## Phase 5 — API Enhancement & Frontend Integration
+
+**Goal**: Wire up the improved RAG to the API and frontend chatbot panel with streaming support.
+
+### [MODIFY] [main.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/main.py)
+- Add **streaming chat endpoint**: `POST /api/chat/stream` using FastAPI `StreamingResponse`
+  - Token-by-token streaming from Ollama
+  - Final metadata packet with citations and confidence score
+- Add **chat history endpoint**: `GET /api/chat/{report_id}/history?session_id=...`
+- Add **RAG diagnostics endpoint**: `GET /api/rag/diagnostics/{report_id}`
+  - Returns: chunk count, embedding status, collection stats, sample queries with scores
+- Update `POST /api/chat` response schema to include structured RAG metadata
+
+### [NEW] [backend/rag/rag_diagnostics.py](file:///c:/Users/Relanto/OneDrive%20-%20Relanto/Desktop/hack/backend/rag/rag_diagnostics.py)
+- Diagnostic tooling for testing:
+  - `test_retrieval(query, report_id)` — show what chunks are retrieved and their scores
+  - `test_reranking(query, report_id)` — show before/after reranking
+  - `collection_stats(report_id)` — chunk count, metadata distribution, embedding dimensions
+  - `run_quality_benchmark(report_id)` — run a standard set of queries and grade responses
+
+### Frontend Integration (scope documented, not implemented in this plan)
+> [!NOTE]
+> Frontend changes are documented here for completeness but will be a separate implementation phase. The backend API contract is designed to be backward-compatible with the existing frontend chat panel.
+
+- Update chat panel to support streaming responses
+- Display confidence score as a visual indicator
+- Show expandable citation cards with source text
+- Add conversation history sidebar
+- Add "RAG quality" indicator (green/yellow/red based on confidence)
+
+### Validation Checkpoint — Phase 5
+```
+1. curl -X POST /api/chat with a question → verify structured response with citations + confidence
+2. curl -X POST /api/chat/stream → verify streaming tokens arrive incrementally
+3. curl -X GET /api/chat/{id}/history → verify conversation history persists
+4. curl -X GET /api/rag/diagnostics/{id} → verify chunk stats and sample queries
+5. Run full end-to-end: Upload PDF → Wait for processing → Ask 5 questions → Verify all answers have citations
+```
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> **Embedding model choice**: The architecture guide specifies `BAAI/bge-large-en-v1.5` (1.34 GB). On your machine, do you want to:
+> - (a) Use this model (best quality, requires ~2GB RAM for the model)
+> - (b) Use a lighter model like `all-MiniLM-L6-v2` (80MB, decent quality)
+> - (c) Keep mock embeddings for now and switch to real ones later
+
+> [!IMPORTANT]
+> **Ollama model**: The code currently uses `qwen2.5:3b-instruct` (smaller) but the architecture guide says `qwen2.5:7b-instruct`. Which model do you actually have pulled in Ollama? This affects timeout settings and prompt length limits.
+
+> [!IMPORTANT]
+> **Re-ranker model**: Phase 2 proposes a cross-encoder re-ranker (`cross-encoder/ms-marco-MiniLM-L-6-v2`, ~80MB). Do you want to include this, or should we use a lightweight heuristic re-ranker to avoid another model download?
+
+> [!IMPORTANT]
+> **Scope**: Should Phase 5 frontend integration be included in this implementation, or do you want to handle the frontend separately? The current plan keeps it backend-only with a documented API contract.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+After each phase:
+- Start the FastAPI server: `uvicorn backend.main:app --reload`
+- Run curl/httpie commands against the API endpoints
+- Upload a test PDF and verify the pipeline completes
+- Query the chatbot and verify response structure
+
+### Manual Verification  
+- Upload a real NVIDIA 10-K PDF
+- Ask domain-specific questions and verify citation accuracy
+- Test multi-turn conversations
+- Test edge cases: empty queries, unknown companies, very long queries
+
+---
+
+## Dependency Summary
+
+### New Python packages needed:
+| Package | Phase | Purpose |
+|---------|-------|---------|
+| `rank_bm25` | Phase 2 | BM25 keyword search for hybrid retrieval |
+| `cross-encoder` (via sentence-transformers) | Phase 2 | Re-ranking retrieved chunks |
+
+### Existing packages used:
+- `chromadb`, `langchain`, `sentence-transformers`, `requests`, `numpy` — already in stack
+
+---
+
+## File Change Summary
+
+| Phase | New Files | Modified Files |
+|-------|-----------|----------------|
+| 1 | 0 | 5 (embedding_tool, chunking, chroma_tool, langgraph_flow, main) |
+| 2 | 3 (reranker, hybrid_search, query_router) | 1 (retrieval) |
+| 3 | 2 (conversation_memory, prompt_templates) | 2 (retrieval, main) |
+| 4 | 3 (citation_verifier, hallucination_guard, answer_formatter) | 1 (retrieval) |
+| 5 | 1 (rag_diagnostics) | 1 (main) |
+| **Total** | **9 new files** | **5 modified files** |
