@@ -96,3 +96,124 @@ def analyze_risk_heuristics(text: str) -> List[dict]:
             "implication": "Narrative cites broader market volatility affecting outlook.",
         })
     return risks
+
+
+def _term_density(text: str, terms: tuple[str, ...]) -> int:
+    lower = (text or "").lower()
+    return sum(lower.count(term) for term in terms)
+
+
+def _snippet_for_query(text: str, user_query: str, max_len: int = 400) -> str:
+    """Return the best-matching sentence from retrieved text for the user's question."""
+    if not text:
+        return ""
+    keywords = [
+        w.strip("?,.!")
+        for w in (user_query or "").lower().split()
+        if len(w) > 3
+    ]
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    for sentence in sentences:
+        lower = sentence.lower()
+        if keywords and any(k in lower for k in keywords):
+            return sentence.strip()[:max_len]
+    return (sentences[0].strip()[:max_len] if sentences else text[:max_len])
+
+
+def comparative_analysis_from_contexts(
+    original_analysis: dict,
+    scraped_contexts: list,
+    company_name: str,
+    user_query: str = "",
+) -> dict:
+    """
+    Evidence-only comparative output derived from uploaded analysis + scraped text.
+    No preset peers, tickers, or canned benchmark numbers.
+    """
+    risk_terms = (
+        "risk", "supply", "competition", "regulatory", "uncertainty",
+        "shortage", "margin", "revenue", "litigation", "cyber",
+    )
+    tone_terms = (
+        "cautious", "optimistic", "growth", "decline", "uncertain",
+        "confident", "adverse", "favorable", "headwind", "tailwind",
+    )
+
+    orig_parts: List[str] = []
+    for risk in original_analysis.get("risks") or []:
+        if isinstance(risk, dict):
+            orig_parts.append(str(risk.get("evidence") or ""))
+            orig_parts.append(str(risk.get("risk_name") or ""))
+    orig_parts.append(str(original_analysis.get("executive_summary") or ""))
+    orig_text = " ".join(orig_parts)
+    orig_risk_density = _term_density(orig_text, risk_terms)
+    orig_tone_density = _term_density(orig_text, tone_terms)
+
+    benchmarks: List[dict] = []
+    tone_shifts: List[dict] = []
+    summary_parts: List[str] = []
+
+    for ctx in scraped_contexts:
+        peer_label = str(ctx.get("company") or ctx.get("source") or "Retrieved peer").strip()
+        peer_text = str(ctx.get("text") or "")
+        peer_risk_density = _term_density(peer_text, risk_terms)
+        peer_tone_density = _term_density(peer_text, tone_terms)
+
+        benchmarks.append(
+            {
+                "metric_name": "Risk-term density (retrieved excerpt)",
+                "target_company": company_name,
+                "competitor_company": peer_label,
+                "comparison_value": (
+                    f"{company_name}: {orig_risk_density} occurrences vs "
+                    f"{peer_label}: {peer_risk_density} in validated scrape sample"
+                ),
+            }
+        )
+        benchmarks.append(
+            {
+                "metric_name": "Tone-term density (retrieved excerpt)",
+                "target_company": company_name,
+                "competitor_company": peer_label,
+                "comparison_value": (
+                    f"{company_name}: {orig_tone_density} vs {peer_label}: {peer_tone_density}"
+                ),
+            }
+        )
+
+        if peer_tone_density > orig_tone_density:
+            direction = "More cautionary / adverse language in peer excerpt"
+        elif peer_tone_density < orig_tone_density:
+            direction = "Less cautionary language in peer excerpt vs filing"
+        else:
+            direction = "Similar tone-term density"
+
+        tone_shifts.append(
+            {
+                "comparison_target": peer_label,
+                "shift_direction": direction,
+                "details": _snippet_for_query(peer_text, user_query),
+            }
+        )
+        summary_parts.append(
+            f"Benchmarked {company_name} against {peer_label} using "
+            f"{len(peer_text)} characters of validated external text."
+        )
+
+    question = (user_query or "").strip() or "peer comparison"
+    comparative_analysis = (
+        f"Comparison driven by your question: \"{question}\". "
+        + " ".join(summary_parts)
+        + " All figures above are counted from retrieved filing text only."
+    )
+
+    return {
+        "original_summary": str(original_analysis.get("executive_summary") or ""),
+        "comparative_analysis": comparative_analysis,
+        "tone_shifts": tone_shifts,
+        "competitor_benchmarks": benchmarks,
+        "explainability_synthesis": (
+            "Operational risk framing should be read alongside the exact excerpts "
+            "retrieved for this query; no static peer assumptions were applied."
+        ),
+    }

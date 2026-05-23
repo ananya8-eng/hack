@@ -136,35 +136,29 @@ def targets_to_requests(targets: List[str], company_name: str) -> List[Dict[str,
 def build_heuristic_scrape_requests(
     text: str, user_query: str, company_name: str
 ) -> Dict[str, Any]:
-    """Fallback when the LLM is unavailable: use the user's question as the web search."""
+    """Fallback when the LLM is unavailable: mirror the user's question only."""
     if not _needs_external_context(user_query, text):
         return {"needs_scraping": False, "reason": "", "scrape_requests": [], "targets": []}
 
     requests: List[Dict[str, Any]] = []
     query = (user_query or "").strip()
-    if query:
-        requests.append(
-            {
-                "type": "web_search",
-                "query": query,
-                "company": company_name,
-                "filing_type": "WEB",
-                "purpose": "User-requested external financial context",
-            }
-        )
-    else:
-        requests.append(
-            {
-                "type": "web_search",
-                "query": (
-                    f"What are the main competitors and industry risks for "
-                    f"{company_name} based on recent SEC filings?"
-                ),
-                "company": company_name,
-                "filing_type": "WEB",
-                "purpose": "Inferred peer and risk context from filing narrative",
-            }
-        )
+    if not query:
+        return {
+            "needs_scraping": False,
+            "reason": "Comparison requires a specific question naming peers or metrics.",
+            "scrape_requests": [],
+            "targets": [],
+        }
+
+    requests.append(
+        {
+            "type": "web_search",
+            "query": query,
+            "company": company_name,
+            "filing_type": "WEB",
+            "purpose": "User-requested external financial context",
+        }
+    )
 
     query_lower = query.lower()
     if any(w in query_lower for w in ("previous year", "prior year", "historical", "yoy")):
@@ -211,6 +205,72 @@ def build_heuristic_scrape_requests(
         "scrape_requests": requests[:5],
         "targets": [],
     }
+
+
+def plan_comparison_scrapes(
+    user_query: str,
+    company_name: str,
+    filing_excerpt: str,
+) -> Dict[str, Any]:
+    """
+    LLM-planned scrape targets for a chat comparison question.
+    Falls back to query-only heuristics (no invented competitor list).
+    """
+    from backend.agents.llm_client import llm_client
+
+    query = (user_query or "").strip()
+    if not query:
+        return {
+            "needs_scraping": False,
+            "reason": "Empty comparison question.",
+            "scrape_requests": [],
+            "targets": [],
+        }
+
+    prompt = f"""
+[System] You plan external data fetches to answer ONE user comparison question about an SEC filing.
+
+[Uploaded company]
+{company_name}
+
+[User question]
+{query}
+
+[Filing excerpt]
+{(filing_excerpt or "")[:2500]}
+
+[Rules]
+- Only request sources needed to answer THIS question.
+- Do NOT assume or inject competitor names unless the user or filing excerpt names them.
+- Prefer web_search using the user's exact comparison intent as the query when discovery is needed.
+- Use sec_filing only for companies explicitly named in the user question (resolve to tickers in scrape_requests).
+- Use prior_filing only when the user asks for year-over-year / prior period on {company_name}.
+- Maximum 5 scrape_requests.
+
+Return strict JSON:
+{{
+  "needs_scraping": true,
+  "reason": "short reason",
+  "scrape_requests": [
+    {{
+      "type": "web_search | sec_filing | prior_filing",
+      "query": "required for web_search — use the user's comparison wording",
+      "company": "ticker or company label",
+      "filing_type": "10-K | 10-Q | WEB",
+      "purpose": "why this fetch answers the question"
+    }}
+  ],
+  "targets": []
+}}
+"""
+
+    parsed = llm_client.generate_json(prompt, temperature=0.1, timeout=60)
+    if isinstance(parsed, dict):
+        return normalize_scraping_decision(
+            parsed, filing_excerpt or "", query, company_name
+        )
+
+    return build_heuristic_scrape_requests(filing_excerpt or "", query, company_name)
 
 
 def normalize_scraping_decision(

@@ -6,14 +6,15 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from backend.agents.financial_agent import financial_agent
+from backend.guardrails import guardrails
 from backend.agents.healing_loop import run_comparative_with_healing, run_scrape_with_healing
 from backend.agents.validator_agent import validator_agent
 from backend.rag.chunking import split_text_into_chunks
 from backend.tools.chroma_tool import chromadb_manager
 from backend.tools.scrape_plan import (
-    build_heuristic_scrape_requests,
     companies_from_requests,
     is_comparison_query,
+    plan_comparison_scrapes,
     resolve_request_tickers,
 )
 from backend.tools.scraper import financial_scraper
@@ -111,15 +112,22 @@ def run_chat_peer_comparison(
     if not is_comparison_query(user_message, filing_text):
         return {"handled": False}
 
+    input_guard = guardrails.check_chat_message(user_message)
+    if not input_guard.allowed:
+        payload = input_guard.to_api_payload()
+        payload["handled"] = True
+        payload["mode"] = "comparison"
+        return payload
+
+    user_message = input_guard.sanitized_text or user_message
+
     def progress(msg: str) -> None:
         logger.info(msg)
         if on_progress:
             on_progress(msg)
 
-    progress("Comparison intent detected — building scrape plan...")
-    scrape_decision = build_heuristic_scrape_requests(
-        filing_text, user_message, company
-    )
+    progress("Comparison intent detected — planning live scrape targets from your question...")
+    scrape_decision = plan_comparison_scrapes(user_message, company, filing_text)
     scrape_requests = list(scrape_decision.get("scrape_requests") or [])
     if not scrape_requests:
         return {
@@ -127,13 +135,16 @@ def run_chat_peer_comparison(
             "success": False,
             "mode": "comparison",
             "answer": (
-                "I understood this as a peer comparison request, but could not derive "
-                "which competitor or period to fetch. Try: "
-                f"\"Compare {company} against AMD on supply chain and gross margins.\""
+                "I understood this as a peer comparison request, but need a clearer target. "
+                f"Name the company or period to benchmark against {company} "
+                "(for example: \"Compare against [ticker] on supply chain and gross margins\")."
             ),
             "citations": [],
             "comparison": None,
-            "status_steps": ["No scrape targets derived from the question."],
+            "status_steps": [
+                scrape_decision.get("reason")
+                or "No scrape targets derived from the question."
+            ],
         }
 
     scrape_requests = resolve_request_tickers(
@@ -210,8 +221,8 @@ def run_chat_peer_comparison(
             "mode": "comparison",
             "answer": (
                 "I attempted to fetch peer filing data for your comparison, but no sources "
-                "passed validation. Rephrase with a specific public company (e.g. AMD, Intel) "
-                "or check that SEC/network access is available."
+                "passed validation. Name a specific public company or filing period in your "
+                "question, or check that SEC/network access is available."
             ),
             "citations": [],
             "comparison": None,
@@ -223,7 +234,10 @@ def run_chat_peer_comparison(
 
     def _compare() -> dict:
         return financial_agent.analyze_comparative(
-            original_analysis, validated_contexts, company
+            original_analysis,
+            validated_contexts,
+            company,
+            user_query=user_message,
         )
 
     comp_result, heal_logs = run_comparative_with_healing(_compare)

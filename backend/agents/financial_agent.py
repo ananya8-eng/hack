@@ -4,6 +4,7 @@ from typing import List
 
 from backend.agents.analysis_heuristics import (
     analyze_risk_heuristics,
+    comparative_analysis_from_contexts,
     compute_sentiment_heuristics,
 )
 from backend.agents.llm_client import llm_client
@@ -230,54 +231,69 @@ class FinancialAgent:
             "targets": targets,
         }
 
-    def analyze_comparative(self, original_analysis: dict, scraped_contexts: list, company_name: str) -> dict:
+    def analyze_comparative(
+        self,
+        original_analysis: dict,
+        scraped_contexts: list,
+        company_name: str,
+        user_query: str = "",
+    ) -> dict:
         """
         Combines original filing analysis with scraped contexts (competitors/previous years)
         to perform advanced multi-document financial benchmarking and shift detection.
         """
         logger.info("Financial Agent performing comparative re-analysis...")
-        
-        # Build prompt for re-analysis
+        question = (user_query or "").strip()
+
         scraped_summaries = []
         for i, ctx in enumerate(scraped_contexts):
             scraped_summaries.append(
-                f"Source {i+1}: {ctx.get('source')}\n"
+                f"Source {i+1}: {ctx.get('source')} ({ctx.get('company', 'external')})\n"
                 f"Content: {ctx.get('text', '')[:2000]}\n"
             )
-        
+
         scraped_text_block = "\n".join(scraped_summaries)
 
         prompt = f"""
         [System] You are an elite AI Financial Intelligence Analyst performing comparative benchmarking.
-        We have analyzed {company_name}'s original filing and retrieved external contexts.
-        
+        Answer ONLY from the original analysis and validated external contexts below.
+        Do NOT invent metrics, companies, or figures not supported by the provided text.
+
+        [User comparison question]
+        {question or "General peer benchmark requested."}
+
+        [Uploaded company]
+        {company_name}
+
         [Original Analysis]
         {json.dumps(original_analysis, indent=2)}
-        
+
         [Validated External Contexts]
         {scraped_text_block}
-        
+
         [Task]
-        Perform a comprehensive cross-comparison and return a strict JSON document. Ensure the keys match exactly:
+        Perform a cross-comparison that directly addresses the user question.
+        Use competitor names ONLY as they appear in the contexts or the user question.
+        Return strict JSON with these keys:
         {{
             "original_summary": "Brief summary of original analysis",
-            "comparative_analysis": "An extremely detailed comparison explaining key differences in risk profiles, supply chain setups, and business models between {company_name} and the competitors/historical years.",
+            "comparative_analysis": "Detailed comparison grounded in the supplied texts",
             "tone_shifts": [
                 {{
-                    "comparison_target": "Previous Year / Competitor (e.g. AMD)",
-                    "shift_direction": "Cautious Shift / Optimistic Shift / Peer Benchmark",
-                    "details": "Explanation of how management tone, metrics, or risk discussions shifted."
+                    "comparison_target": "Named peer or prior period from the contexts",
+                    "shift_direction": "Cautious / Optimistic / Neutral shift label",
+                    "details": "Evidence-backed explanation"
                 }}
             ],
             "competitor_benchmarks": [
                 {{
-                    "metric_name": "Supply Chain Mention Density / Capital Investment / Revenue Focus",
+                    "metric_name": "Metric you can support from the texts",
                     "target_company": "{company_name}",
-                    "competitor_company": "AMD or Intel or Previous Year",
-                    "comparison_value": "Quantitative or qualitative benchmark details (e.g., Mentioned 18 times vs 6 times)"
+                    "competitor_company": "Peer name from retrieved context",
+                    "comparison_value": "Qualitative or counted comparison from the texts only"
                 }}
             ],
-            "explainability_synthesis": "Explanatory framework on how these comparative factors influence the stock's operational risk."
+            "explainability_synthesis": "How these factors affect operational risk per the evidence"
         }}
         """
 
@@ -295,121 +311,14 @@ class FinancialAgent:
             return parsed
 
         logger.warning(
-            "Comparative LLM did not return valid JSON after retries; using heuristic fallback"
+            "Comparative LLM did not return valid JSON after retries; using evidence-only fallback"
         )
-
-        # ==========================================
-        # HEURISTIC COMPARATIVE FALLBACK
-        # ==========================================
-        logger.info("Executing Heuristic Comparative Fallback...")
-        
-        # Analyze comparative data dynamically
-        comp_summaries = []
-        tone_shifts = []
-        benchmarks = []
-        
-        company_upper = company_name.upper().strip()
-        
-        for ctx in scraped_contexts:
-            source = ctx.get("source", "External")
-            source_company = ctx.get("company", "Peer").upper().strip()
-            
-            # Simple comparative density analysis
-            orig_risk_count = len(original_analysis.get("risks", []))
-            
-            if "PREVIOUS" in source.upper() or source_company == company_upper:
-                # Historical Year-over-Year comparison
-                comp_summaries.append(f"Historical benchmarking against {company_upper} prior periods.")
-                
-                tone_shifts.append({
-                    "comparison_target": "Prior Year Filing",
-                    "shift_direction": "Increased Cautionary Stance",
-                    "details": (
-                        f"Management's caution levels rose by approximately 15% year-over-year. "
-                        f"The focus shifted heavily from market footprint expansion to wafer supply security "
-                        f"and bottlenecks in advanced chip packaging capabilities (CoWoS)."
-                    )
-                })
-                
-                benchmarks.append({
-                    "metric_name": "Supply Chain Risk Mentions",
-                    "target_company": company_upper,
-                    "competitor_company": "Prior Year 10-K",
-                    "comparison_value": "18 risk indicators detected vs 12 previously (50% increase)"
-                })
-                benchmarks.append({
-                    "metric_name": "Operating Cash Flow Allocation",
-                    "target_company": company_upper,
-                    "competitor_company": "Prior Year 10-K",
-                    "comparison_value": "Higher CAPEX prioritization for foundry purchase commitments"
-                })
-            else:
-                # Competitor comparison (e.g. AMD, Intel)
-                comp_summaries.append(f"Competitor comparison against {source_company}.")
-                
-                tone_shifts.append({
-                    "comparison_target": f"Competitor {source_company}",
-                    "shift_direction": "Resource Specialization Gap",
-                    "details": (
-                        f"Whereas {company_upper} is in an aggressive growth phase characterized by extremely high margin margins "
-                        f"and extreme capacity expansion, {source_company} presents a profile focused on high architectural "
-                        f"adaptability (e.g., chiplet architectures like MI300X) but carries higher dependency ratios on "
-                        f"advanced secondary packaging allocations."
-                    )
-                })
-                
-                # Dynamic realistic metric benchmarks
-                if "AMD" in source_company:
-                    benchmarks.append({
-                        "metric_name": "AI Accelerator Risk Keyword Density",
-                        "target_company": company_upper,
-                        "competitor_company": "AMD",
-                        "comparison_value": "NVIDIA is cited in risk narratives 22 times vs AMD's 8 times, indicating higher pricing power scrutiny."
-                    })
-                    benchmarks.append({
-                        "metric_name": "Gross Margin Profile",
-                        "target_company": company_upper,
-                        "competitor_company": "AMD",
-                        "comparison_value": "74% record margins vs AMD's 47%, reflecting a stronger software ecosystem (CUDA) advantage."
-                    })
-                elif "INTEL" in source_company:
-                    benchmarks.append({
-                        "metric_name": "Foundry Model Capital Allocation",
-                        "target_company": company_upper,
-                        "competitor_company": "Intel",
-                        "comparison_value": "Asset-light fabless model vs Intel's multi-fab IFS construction model (extremely capital-intensive)."
-                    })
-                    benchmarks.append({
-                        "metric_name": "Data Center Revenue Growth",
-                        "target_company": company_upper,
-                        "competitor_company": "Intel",
-                        "comparison_value": "250% segment expansion vs Intel's server segment contraction."
-                    })
-
-        # Synthesize overall comparative text
-        comp_summary_joined = " ".join(comp_summaries)
-        comparative_analysis = (
-            f"Benchmarking analysis reveals distinct competitive postures. {company_upper} maintains "
-            f"superior commercial momentum and record pricing power, but exhibits a higher supply chain clustering risk "
-            f"due to sole-source advanced foundry contracts. In contrast, competitors like AMD or Intel present lower "
-            f"gross margins but are aggressively positioning themselves. Intel represents a structural fabrication divergence "
-            f"with itsIFS initiative, while AMD focuses on high compatibility and lower entry pricing. "
-            f"The comparative risk index demonstrates that {company_upper} is highly sensitive to single-point shipping delays."
+        return comparative_analysis_from_contexts(
+            original_analysis,
+            scraped_contexts,
+            company_name,
+            user_query=question,
         )
-
-        explain_synthesis = (
-            f"The comparative factors prove that {company_upper}'s high valuation is deeply coupled with "
-            f"maintaining TSMC packaging priorities. Any disruption in packaging limits will trigger immediate market share gains "
-            f"for AMD's Instinct accelerators, making AMD a crucial hedge for tech portfolio asset managers."
-        )
-
-        return {
-            "original_summary": original_analysis.get("executive_summary", ""),
-            "comparative_analysis": comparative_analysis,
-            "tone_shifts": tone_shifts,
-            "competitor_benchmarks": benchmarks,
-            "explainability_synthesis": explain_synthesis
-        }
 
 # Singleton helper
 financial_agent = FinancialAgent()

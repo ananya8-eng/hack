@@ -2,6 +2,7 @@ import logging
 import re
 
 from backend.agents.llm_client import llm_client
+from backend.guardrails import guardrails
 from backend.tools.chroma_tool import chromadb_manager
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,13 @@ class RAGChatbot:
         Retrieves top relevant chunks from ChromaDB and uses Qwen (or Heuristic RAG)
         to answer with precise inline citations, avoiding hallucinations.
         """
+        input_guard = guardrails.check_chat_message(user_question)
+        if not input_guard.allowed:
+            payload = input_guard.to_api_payload()
+            payload["mode"] = "rag"
+            return payload
+
+        user_question = input_guard.sanitized_text or user_question
         logger.info(f"RAG Chatbot processing question: '{user_question}'...")
         
         # Determine query filter
@@ -148,7 +156,25 @@ class RAGChatbot:
         """
 
         response_text = llm_client.generate(prompt, temperature=0.1, timeout=60)
-        
+
+        if not response_text:
+            return {
+                "answer": (
+                    "I could not produce a safe, evidence-backed answer. "
+                    "Rephrase your filing question or try again."
+                ),
+                "citations": [],
+                "success": False,
+                "guardrail_blocked": True,
+            }
+
+        output_guard = guardrails.check_llm_text_output(response_text)
+        if not output_guard.allowed:
+            payload = output_guard.to_api_payload()
+            payload["mode"] = "rag"
+            return payload
+        response_text = output_guard.sanitized_text or response_text
+
         if response_text and len(response_text.strip()) > 50:
             # Build citations list for UI display
             citations = []
@@ -176,7 +202,15 @@ class RAGChatbot:
         # HEURISTIC RAG FALLBACK
         # ==========================================
         logger.info("Executing Heuristic RAG Q&A Engine...")
-        return generate_heuristic_rag_answer(user_question, chunks)
+        heuristic = generate_heuristic_rag_answer(user_question, chunks)
+        out_guard = guardrails.check_llm_text_output(heuristic.get("answer", ""))
+        if not out_guard.allowed:
+            payload = out_guard.to_api_payload()
+            payload["mode"] = "rag"
+            return payload
+        if out_guard.sanitized_text:
+            heuristic = {**heuristic, "answer": out_guard.sanitized_text}
+        return heuristic
 
 # Singleton helper
 rag_chatbot = RAGChatbot()

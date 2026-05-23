@@ -11,6 +11,7 @@ from backend.graph.langgraph_flow import run_financial_pipeline
 from backend.ingestion.pdf_extractor import extract_pdf_text
 from backend.tools.embedding_tool import embedding_manager
 from backend.logging_config import configure_logging
+from backend.guardrails import guardrails
 from backend.rag.chat_comparison import run_chat_peer_comparison
 from backend.rag.retrieval import rag_chatbot
 from backend.tools.scrape_plan import is_comparison_query
@@ -25,7 +26,11 @@ app = FastAPI(title="AI-Powered Financial Intelligence Platform API")
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "service": "aegis-financial-api"}
+    return {
+        "status": "ok",
+        "service": "aegis-financial-api",
+        "guardrails_enabled": settings.guardrails_enabled,
+    }
 
 
 @app.on_event("startup")
@@ -53,6 +58,22 @@ class ChatRequest(BaseModel):
 class TriggerRequest(BaseModel):
     report_id: str
     query: Optional[str] = ""
+
+
+def _guard_or_http(result, status_code: int = 400):
+    if result.allowed:
+        return None
+    raise HTTPException(
+        status_code=status_code,
+        detail={
+            "guardrail_blocked": True,
+            "violations": [
+                {"code": v.code, "message": v.message, "severity": v.severity}
+                for v in result.violations
+            ],
+            "message": result.user_message(),
+        },
+    )
 
 # Utility to guess company ticker/name from filename
 def guess_company_from_filename(filename: str) -> str:
@@ -222,6 +243,9 @@ async def upload_filing(
             raise HTTPException(status_code=400, detail="Empty file uploaded.")
 
         company = company_name if company_name else guess_company_from_filename(filename)
+        query_guard = guardrails.check_upload_query(user_query or "")
+        _guard_or_http(query_guard)
+
         report_id = str(uuid.uuid4())
 
         REPORTS_DB[report_id] = {
@@ -315,10 +339,13 @@ async def trigger_analysis(req: TriggerRequest, background_tasks: BackgroundTask
     result = report.get("result")
     if not result:
         raise HTTPException(status_code=400, detail="Report has not finished processing yet.")
-        
+
+    query_guard = guardrails.check_upload_query(req.query or "")
+    _guard_or_http(query_guard)
+
     raw_text = result.get("raw_text", "")
     company = report["company_name"]
-    
+
     # Reset status
     report["status"] = "queued"
     report["current_step"] = "Re-triggering pipeline..."
@@ -350,6 +377,14 @@ async def chatbot_query(req: ChatRequest):
     if report_id not in REPORTS_DB:
         raise HTTPException(status_code=404, detail="Report not found.")
 
+    chat_guard = guardrails.check_chat_message(req.message)
+    if not chat_guard.allowed:
+        payload = chat_guard.to_api_payload()
+        payload["mode"] = "blocked"
+        return payload
+
+    safe_message = chat_guard.sanitized_text or req.message
+
     report = REPORTS_DB[report_id]
     company = report["company_name"]
     result = report.get("result") or {}
@@ -360,17 +395,27 @@ async def chatbot_query(req: ChatRequest):
     else:
         filing_excerpt = str(result.get("raw_text") or "")[:8000]
 
-    if is_comparison_query(req.message, filing_excerpt):
+    if is_comparison_query(safe_message, filing_excerpt):
         if not result:
             raise HTTPException(
                 status_code=400,
                 detail="Report analysis is not ready yet. Wait for the pipeline to finish.",
             )
-        comparison_res = run_chat_peer_comparison(report, req.message)
+        comparison_res = run_chat_peer_comparison(report, safe_message)
         if comparison_res.get("handled"):
+            if comparison_res.get("answer"):
+                out_guard = guardrails.check_llm_text_output(comparison_res["answer"])
+                if not out_guard.allowed:
+                    blocked = out_guard.to_api_payload()
+                    blocked["mode"] = "comparison"
+                    return blocked
+                comparison_res = {
+                    **comparison_res,
+                    "answer": out_guard.sanitized_text or comparison_res["answer"],
+                }
             return comparison_res
 
-    chatbot_res = rag_chatbot.query_chatbot(req.message, company)
+    chatbot_res = rag_chatbot.query_chatbot(safe_message, company)
     chatbot_res["mode"] = "rag"
     return chatbot_res
 

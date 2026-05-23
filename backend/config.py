@@ -78,6 +78,14 @@ class Settings:
     max_map_passes: int
     max_heal_attempts: int
 
+    # Guardrails
+    guardrails_enabled: bool
+    guardrails_require_financial_scope: bool
+    guardrails_max_chat_chars: int
+    guardrails_max_upload_query_chars: int
+    guardrails_max_prompt_chars: int
+    guardrails_max_llm_output_chars: int
+
     # SEC EDGAR & scraping
     sec_edgar_company_name: str
     sec_edgar_email: str
@@ -131,6 +139,22 @@ def get_settings() -> Settings:
         map_analysis_chunk_chars=_env_int("MAP_ANALYSIS_CHUNK_CHARS", 3500),
         max_map_passes=_env_int("MAX_MAP_PASSES", 24),
         max_heal_attempts=_env_int("MAX_HEAL_ATTEMPTS", 3),
+        guardrails_enabled=_env_bool("GUARDRAILS_ENABLED", True),
+        guardrails_require_financial_scope=_env_bool(
+            "GUARDRAILS_REQUIRE_FINANCIAL_SCOPE", True
+        ),
+        guardrails_max_chat_chars=_env_int(
+            "GUARDRAILS_MAX_CHAT_CHARS", 4_000
+        ),
+        guardrails_max_upload_query_chars=_env_int(
+            "GUARDRAILS_MAX_UPLOAD_QUERY_CHARS", 2_000
+        ),
+        guardrails_max_prompt_chars=_env_int(
+            "GUARDRAILS_MAX_PROMPT_CHARS", 200_000
+        ),
+        guardrails_max_llm_output_chars=_env_int(
+            "GUARDRAILS_MAX_LLM_OUTPUT_CHARS", 32_000
+        ),
         sec_edgar_company_name=_env("SEC_EDGAR_COMPANY_NAME", "AegisFinancialAgent"),
         sec_edgar_email=_env("SEC_EDGAR_EMAIL", "aegis@financialintel.ai"),
         scraped_filings_dir=_env("SCRAPED_FILINGS_DIR", "./scraped_filings"),

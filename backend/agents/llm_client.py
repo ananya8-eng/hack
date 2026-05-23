@@ -23,6 +23,7 @@ STRICT_JSON_SUFFIX = (
 import requests
 
 from backend.config import get_settings
+from backend.guardrails import guardrails
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +104,29 @@ class LLMClient:
         temperature: float = 0.1,
         timeout: int | None = None,
     ) -> str:
+        prompt_check = guardrails.prepare_llm_prompt(prompt)
+        if not prompt_check.allowed:
+            logger.warning(
+                "Guardrails blocked LLM prompt: %s",
+                [v.code for v in prompt_check.violations],
+            )
+            return ""
+        safe_prompt = prompt_check.sanitized_text or prompt
+
         effective_timeout = timeout if timeout is not None else self.default_timeout
-        for name, fn in self._provider_chain(prompt, temperature, effective_timeout):
+        for name, fn in self._provider_chain(
+            safe_prompt, temperature, effective_timeout
+        ):
             text = self._call_provider(name, fn)
             if text:
-                return text
+                output_check = guardrails.check_llm_text_output(text)
+                if output_check.allowed:
+                    return output_check.sanitized_text or text
+                logger.warning(
+                    "Guardrails blocked LLM output from %s: %s",
+                    name,
+                    [v.code for v in output_check.violations],
+                )
         logger.warning("All LLM providers failed or returned empty")
         return ""
 
@@ -132,6 +151,15 @@ class LLMClient:
         if "json.loads()" not in base_prompt:
             base_prompt = f"{base_prompt}{STRICT_JSON_SUFFIX}"
 
+        prompt_check = guardrails.prepare_llm_prompt(base_prompt)
+        if not prompt_check.allowed:
+            logger.warning(
+                "Guardrails blocked JSON LLM prompt: %s",
+                [v.code for v in prompt_check.violations],
+            )
+            return None
+        base_prompt = prompt_check.sanitized_text or base_prompt
+
         provider_names = [name for name, _ in self._provider_chain(
             base_prompt, temperature, effective_timeout
         )]
@@ -151,13 +179,24 @@ class LLMClient:
                 )
                 parsed = parse_json_from_llm(response_text) if response_text else None
                 if parsed is not None and (validator is None or validator(parsed)):
-                    if attempt > 1 or provider_idx > 0:
-                        logger.info(
-                            "LLM returned parseable JSON from %s (attempt %s)",
+                    json_guard = guardrails.check_llm_json_output(parsed)
+                    if not json_guard.allowed:
+                        logger.warning(
+                            "Guardrails blocked JSON from %s: %s",
                             provider_name,
-                            attempt,
+                            [v.code for v in json_guard.violations],
                         )
-                    return parsed
+                        parsed = None
+                    else:
+                        if attempt > 1 or provider_idx > 0:
+                            logger.info(
+                                "LLM returned parseable JSON from %s (attempt %s)",
+                                provider_name,
+                                attempt,
+                            )
+                        return parsed
+                if parsed is not None:
+                    continue
 
                 if attempt < max_attempts:
                     logger.warning(

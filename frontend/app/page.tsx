@@ -135,7 +135,7 @@ export default function Home() {
         setCurrentStep(fullReport.current_step || "Complete");
         setChatMessages([{
           id: 1, role: "assistant",
-          content: `Earnings narrative analysis for ${fullReport.company_name} is complete. Ask about MD&A tone, operational risks, or supply chain. For peer benchmarks, ask in chat (e.g. "Compare ${fullReport.company_name} against AMD on gross margins and supply chain risks").`,
+          content: `Earnings narrative analysis for ${fullReport.company_name} is complete. Ask about MD&A tone, operational risks, or supply chain. To benchmark a peer, name the company in chat (e.g. "Compare against [company] on gross margins and supply chain").`,
           citations: []
         }]);
       }
@@ -143,19 +143,6 @@ export default function Home() {
       console.error("Error loading report:", err);
     }
   }, []);
-
-  // Handle template button clicks — uploads representative filing text to the real backend
-  const handleTemplateClick = async (company: "NVIDIA" | "AMD") => {
-    const filingText = company === "NVIDIA"
-      ? "NVIDIA Corporation Annual Report 10-K. ITEM 1A. RISK FACTORS. We rely on TSMC for all semiconductor fabrication. Natural disasters, geopolitical issues in Taiwan, or CoWoS advanced packaging shortages would drastically impact product shipments. Export restrictions on H100 and A100 GPUs to China have forced design of lower-performance alternatives. Competition from AMD Instinct accelerators and open-source ROCm threatens CUDA software moat. ITEM 7. MD&A. Data Center revenues surged 250%. Gross margins reached a record 74% driven by CUDA ecosystem pricing power. Operating cash flow exceeded $28 billion."
-      : "AMD Inc Annual Report 10-K. ITEM 1A. RISK FACTORS. We face intense competition from NVIDIA in high-performance computing and Intel in microprocessors. We rely on TSMC for all semiconductor fabrication. CoWoS capacity constraints at TSMC could severely limit revenue growth. Export controls on AI chips to China present substantial risk. ITEM 7. MD&A. Data Center segment grew 80% driven by Instinct MI300X GPU accelerators. Gross margin expanded to 47%. Gaming segment revenue declined 48% due to lower console chip demand.";
-    const blob = new Blob([filingText], { type: "application/pdf" });
-    const formData = new FormData();
-    formData.append("file", new File([blob], `${company}_10K_2025.pdf`, { type: "application/pdf" }));
-    formData.append("company_name", company);
-    formData.append("user_query", "Extract operational risks and negative sentiment shifts from MD&A and narrative sections. Compare against key industry peers.");
-    await runUploadAndPoll(formData, company);
-  };
 
   // Poll /status while the background LangGraph job runs (not a backend bug).
   const pipelinePollTimeoutMs = Number(
@@ -216,7 +203,7 @@ export default function Home() {
     });
   }, [pipelinePollTimeoutMs]);
 
-  // Shared upload+poll handler used by templates and file upload
+  // Shared upload+poll handler for PDF ingestion
   const runUploadAndPoll = async (formData: FormData, companyHint: string) => {
     setProcessingStatus("processing");
     setPipelineLogs(["Sending PDF to backend..."]);
@@ -260,7 +247,7 @@ export default function Home() {
     if (processingStatus === "processing") return;
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("user_query", "Earnings report risk and sentiment extraction: emphasize MD&A, hidden operational risks, and forward challenges vs headline numbers.");
+    formData.append("user_query", "Extract operational risks and sentiment from MD&A and narrative sections in this filing.");
     try {
       await runUploadAndPoll(formData, file.name.replace(/\.pdf$/i, ""));
     } finally {
@@ -354,19 +341,24 @@ export default function Home() {
             content: data.answer,
             citations: data.citations || [],
             mode: data.mode,
-            comparison: data.comparison || null
+            comparison: data.comparison || null,
+            guardrailBlocked: Boolean(data.guardrail_blocked)
           }];
         });
       } else {
         const errBody = await res.json().catch(() => ({}));
-        const detail = typeof errBody.detail === "string"
-          ? errBody.detail
+        const detailObj = errBody.detail;
+        const detail = typeof detailObj === "string"
+          ? detailObj
+          : typeof detailObj === "object" && detailObj?.message
+          ? detailObj.message
           : "Chat request failed.";
         setChatMessages(prev => [...prev.filter(m => !m.isStatus), {
           id: newId + 1,
           role: "assistant",
           content: detail,
-          citations: []
+          citations: [],
+          guardrailBlocked: Boolean(detailObj?.guardrail_blocked)
         }]);
       }
     } catch (err) {
@@ -502,28 +494,7 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Templates and Upload Actions */}
         <div className="flex items-center space-x-4">
-          <div className="flex items-center bg-indigo-950/50 border border-indigo-900/40 rounded-lg p-1 space-x-1">
-            <span className="text-xs text-indigo-300/40 px-2 font-medium">TEMPLATES:</span>
-            <button 
-              onClick={() => handleTemplateClick("NVIDIA")}
-              disabled={processingStatus === "processing"}
-              className="text-xs font-medium px-3 py-1.5 rounded-md text-white bg-indigo-900/40 border border-indigo-500/20 hover:border-indigo-400/40 hover:bg-indigo-900/60 transition disabled:opacity-50 flex items-center gap-1.5"
-            >
-              <Cpu className="w-3 h-3 text-indigo-400" />
-              NVIDIA 10-K
-            </button>
-            <button 
-              onClick={() => handleTemplateClick("AMD")}
-              disabled={processingStatus === "processing"}
-              className="text-xs font-medium px-3 py-1.5 rounded-md text-white bg-indigo-900/40 border border-indigo-500/20 hover:border-indigo-400/40 hover:bg-indigo-900/60 transition disabled:opacity-50 flex items-center gap-1.5"
-            >
-              <Cpu className="w-3 h-3 text-purple-400" />
-              AMD 10-K
-            </button>
-          </div>
-
           <label className="cursor-pointer text-xs font-semibold px-4 py-2.5 rounded-lg bg-gradient-to-r from-indigo-600 to-purple-600 text-white hover:from-indigo-500 hover:to-purple-500 shadow-md shadow-indigo-600/10 hover:shadow-indigo-500/20 active:scale-95 transition duration-150 flex items-center gap-2">
             <Upload className="w-4 h-4" />
             UPLOAD FILING PDF
@@ -570,7 +541,7 @@ export default function Home() {
             {processingStatus === "idle" && (
               <div className="flex-1 flex flex-col items-center justify-center text-center p-4">
                 <Layers className="w-10 h-10 text-indigo-950 mb-2" />
-                <p className="text-xs text-slate-400">System is idle. Select a preloaded template or upload a new financial PDF to execute the multi-agent pipeline.</p>
+                <p className="text-xs text-slate-400">System is idle. Upload a financial PDF (10-K / 10-Q) to run the multi-agent pipeline.</p>
               </div>
             )}
 
@@ -622,7 +593,7 @@ export default function Home() {
               RAG CHAT &amp; PEER COMPARISON
             </h2>
             <p className="text-[10px] text-slate-500 mb-3">
-              Ask filing questions or compare peers in chat (e.g. &quot;Compare against AMD on margins&quot;).
+              Ask filing questions or name a peer in chat to compare (live SEC/web fetch).
             </p>
 
             {/* Chat message threads */}
@@ -641,6 +612,8 @@ export default function Home() {
                         ? "bg-indigo-600 text-white rounded-br-none" 
                         : msg.isStatus
                         ? "bg-purple-950/30 text-purple-200 border border-purple-800/40 rounded-bl-none italic"
+                        : msg.guardrailBlocked
+                        ? "bg-red-950/30 text-red-100 border border-red-900/50 rounded-bl-none"
                         : msg.mode === "comparison"
                         ? "bg-purple-950/25 text-slate-200 border border-purple-900/40 rounded-bl-none"
                         : "bg-indigo-950/40 text-slate-200 border border-indigo-900/30 rounded-bl-none"
@@ -710,7 +683,7 @@ export default function Home() {
             <form onSubmit={handleSendMessage} className="flex gap-2">
               <input
                 type="text"
-                placeholder={activeReportId ? "Ask about risks, or compare vs AMD, Intel..." : "Load a report first..."}
+                placeholder={activeReportId ? "Ask about risks, or compare vs a named company..." : "Load a report first..."}
                 value={chatInput}
                 onChange={e => setChatInput(e.target.value)}
                 disabled={!activeReportId || isChatLoading}
@@ -773,7 +746,7 @@ export default function Home() {
               {!activeReport ? (
                 <div className="h-full flex flex-col items-center justify-center text-center p-6">
                   <FileText className="w-12 h-12 text-indigo-950 mb-3" />
-                  <p className="text-xs text-slate-400">Filing narrative will display here once processed. Select a template above to see standard output.</p>
+                  <p className="text-xs text-slate-400">Filing narrative will display here once a PDF is processed.</p>
                 </div>
               ) : (
                 renderHighlightedText(

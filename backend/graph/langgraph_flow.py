@@ -385,7 +385,10 @@ def node_comparative_reanalysis(state: AgentState) -> Dict[str, Any]:
 
         def _compare() -> dict:
             return financial_agent.analyze_comparative(
-                orig_analysis, validated_ctxs, company
+                orig_analysis,
+                validated_ctxs,
+                company,
+                user_query=state.get("user_query", ""),
             )
 
         comp_result, comp_heal_logs = run_comparative_with_healing(

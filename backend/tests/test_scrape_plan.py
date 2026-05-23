@@ -75,6 +75,15 @@ def test_extract_peer_companies_from_natural_language():
     assert "Amd" in peers or "AMD" in [p.upper() for p in peers]
 
 
+def test_heuristic_requires_explicit_query():
+    result = build_heuristic_scrape_requests(
+        "Competition in our markets.",
+        "",
+        "Acme Corp",
+    )
+    assert result["needs_scraping"] is False
+
+
 def test_heuristic_adds_sec_filing_for_named_peer():
     result = build_heuristic_scrape_requests(
         "Competition in accelerators.",
