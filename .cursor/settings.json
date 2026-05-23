@@ -1,0 +1,37 @@
+{
+  "plugins": {
+    "superpowers": {
+      "enabled": true
+    },
+    "redis-development": {
+      "enabled": true
+    },
+    "mongodb": {
+      "enabled": true
+    },
+    "huggingface-skills": {
+      "enabled": true
+    },
+    "pinecone": {
+      "enabled": true
+    },
+    "astronomer-data": {
+      "enabled": true
+    },
+    "docs-canvas": {
+      "enabled": true
+    },
+    "shadcn": {
+      "enabled": true
+    },
+    "slack": {
+      "enabled": true
+    },
+    "neon-postgres": {
+      "enabled": true
+    },
+    "firebase": {
+      "enabled": true
+    }
+  }
+}

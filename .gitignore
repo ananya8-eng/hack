@@ -1,0 +1,10 @@
+.env
+.env.local
+.venv/
+__pycache__/
+*.pyc
+chroma_db/
+scraped_filings/
+sec-edgar-filings/
+.pytest_cache/
+.DS_Store

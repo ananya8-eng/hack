@@ -1,7 +1,7 @@
-import re
-import json
 import logging
-import requests
+import re
+
+from backend.agents.llm_client import llm_client
 from backend.tools.chroma_tool import chromadb_manager
 
 logger = logging.getLogger(__name__)
@@ -92,28 +92,6 @@ def generate_heuristic_rag_answer(query: str, chunks: list) -> dict:
     }
 
 class RAGChatbot:
-    def __init__(self, ollama_url="http://localhost:11434/api/generate"):
-        self.ollama_url = ollama_url
-        self.model_name = "qwen2.5:3b-instruct"
-
-    def _call_ollama(self, prompt: str) -> str:
-        try:
-            response = requests.post(
-                self.ollama_url,
-                json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.1}
-                },
-                timeout=12
-            )
-            if response.status_code == 200:
-                return response.json().get("response", "")
-            return ""
-        except Exception:
-            return ""
-
     def query_chatbot(self, user_question: str, company_name: str = None) -> dict:
         """
         Retrieves top relevant chunks from ChromaDB and uses Qwen (or Heuristic RAG)
@@ -169,7 +147,7 @@ class RAGChatbot:
         Synthesize your comprehensive response with citations.
         """
 
-        response_text = self._call_ollama(prompt)
+        response_text = llm_client.generate(prompt, temperature=0.1, timeout=60)
         
         if response_text and len(response_text.strip()) > 50:
             # Build citations list for UI display

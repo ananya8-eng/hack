@@ -1,13 +1,63 @@
-import os
 import logging
+
 import numpy as np
+
+from backend.config import get_settings
 from backend.tools.embedding_tool import embedding_manager
 
 logger = logging.getLogger(__name__)
 
+
+def _flatten_embedding(embedding: list) -> list:
+    """Chroma expects a flat list of floats per vector, not nested lists."""
+    flat = embedding
+    while flat and isinstance(flat[0], list):
+        if len(flat) != 1:
+            break
+        flat = flat[0]
+    return flat
+
+
+_CHROMA_OPERATORS = {"$and", "$or", "$not", "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin"}
+
+
+def _normalize_where_for_chroma(where: dict | None) -> dict | None:
+    """
+    Chroma rejects a multi-key plain dict like {"company": "X", "section": "Y"}
+    because it expects exactly one top-level operator. Wrap multi-key filters
+    in an explicit $and clause.
+    """
+    if not where:
+        return None
+    if len(where) <= 1:
+        return where
+    if any(k in _CHROMA_OPERATORS for k in where.keys()):
+        return where
+    return {"$and": [{k: v} for k, v in where.items()]}
+
+
+def _flatten_where_for_memory(where: dict | None) -> dict:
+    """
+    Collapse a Chroma-style where clause (possibly using $and with simple equality
+    sub-clauses) into a flat {field: value} dict for the in-memory fallback path.
+    Operators other than $and / direct equality are dropped to stay safe.
+    """
+    if not where:
+        return {}
+    if "$and" in where and isinstance(where["$and"], list):
+        flat = {}
+        for sub in where["$and"]:
+            if isinstance(sub, dict):
+                for k, v in sub.items():
+                    if k not in _CHROMA_OPERATORS and not isinstance(v, dict):
+                        flat[k] = v
+        return flat
+    return {k: v for k, v in where.items() if k not in _CHROMA_OPERATORS and not isinstance(v, dict)}
+
+
 class ChromaDBManager:
-    def __init__(self, db_path="./chroma_db"):
-        self.db_path = db_path
+    def __init__(self, db_path: str | None = None):
+        self.db_path = db_path or get_settings().chroma_db_path
         self.client = None
         self.collection = None
         self.use_fallback = False
@@ -15,8 +65,8 @@ class ChromaDBManager:
 
         try:
             import chromadb
-            logger.info(f"Initializing ChromaDB persistent client at: {db_path}")
-            self.client = chromadb.PersistentClient(path=db_path)
+            logger.info("Initializing ChromaDB persistent client at: %s", self.db_path)
+            self.client = chromadb.PersistentClient(path=self.db_path)
             self.collection = self.client.get_or_create_collection("filings")
             logger.info("ChromaDB initialized successfully.")
         except Exception as e:
@@ -30,8 +80,11 @@ class ChromaDBManager:
         if not chunks:
             return
             
-        embeddings = [embedding_manager.get_embedding(chunk) for chunk in chunks]
-        
+        embeddings = [
+            _flatten_embedding(emb)
+            for emb in embedding_manager.get_embeddings(chunks)
+        ]
+
         if self.use_fallback or self.collection is None:
             # Add to in-memory fallback db
             for i, chunk in enumerate(chunks):
@@ -75,7 +128,7 @@ class ChromaDBManager:
         Queries the vector store and returns a list of dictionaries with matching chunks:
         [{"document", "metadata", "score", "id"}]
         """
-        query_emb = embedding_manager.get_embedding(query_text)
+        query_emb = _flatten_embedding(embedding_manager.get_embedding(query_text))
 
         if self.use_fallback or self.collection is None:
             # Manual Cosine Similarity search on in-memory database
@@ -86,11 +139,13 @@ class ChromaDBManager:
             query_vec = np.array(query_emb)
             query_norm = np.linalg.norm(query_vec)
 
+            flat_where = _flatten_where_for_memory(where)
+
             for item in self.fallback_db:
                 # Filter by 'where' metadata filter if present
-                if where:
+                if flat_where:
                     skip = False
-                    for k, v in where.items():
+                    for k, v in flat_where.items():
                         if item["metadata"].get(k) != v:
                             skip = True
                             break
@@ -117,13 +172,13 @@ class ChromaDBManager:
             return results[:n_results]
 
         try:
-            # Query ChromaDB
+            normalized_where = _normalize_where_for_chroma(where)
             query_params = {
                 "query_embeddings": [query_emb],
                 "n_results": n_results
             }
-            if where:
-                query_params["where"] = where
+            if normalized_where:
+                query_params["where"] = normalized_where
 
             chroma_results = self.collection.query(**query_params)
             

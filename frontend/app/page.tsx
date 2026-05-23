@@ -39,6 +39,7 @@ import {
   LineChart,
   Line
 } from "recharts";
+import { apiUrl } from "@/lib/api";
 
 
 export default function Home() {
@@ -54,7 +55,7 @@ export default function Home() {
   const [pipelineLogs, setPipelineLogs] = useState<string[]>([]);
   
   // Ingestion Viewer navigation
-  const [activeFilingTab, setActiveFilingTab] = useState<"risk_factors" | "mda" | "forward_looking">("risk_factors");
+  const [activeFilingTab, setActiveFilingTab] = useState<string>("");
   const [activeEvidenceText, setActiveEvidenceText] = useState<string | null>(null);
   const [activeHighlightId, setActiveHighlightId] = useState<string | null>(null);
   
@@ -92,26 +93,53 @@ export default function Home() {
 
   // On page load, verify backend connection
   useEffect(() => {
-    fetch("http://localhost:8000/api/reports")
-      .then(r => { if (r.ok) { setBackendOnline(true); return r.json(); } throw new Error(); })
+    fetch(apiUrl("/api/health"))
+      .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+      .then(() => setBackendOnline(true))
+      .catch(() => setBackendOnline(false));
+
+    fetch(apiUrl("/api/reports"))
+      .then(r => { if (r.ok) return r.json(); return []; })
       .then(list => setReportsList(list))
-      .catch(() => { setBackendOnline(false); console.warn("Backend offline."); });
+      .catch(() => console.warn("Could not load reports list."));
   }, []);
+
+  const getSectionCatalog = (report: any) => {
+    const cat = report?.result?.section_catalog;
+    if (Array.isArray(cat) && cat.length > 0) return cat;
+    const secs = report?.result?.sections || {};
+    return Object.keys(secs).map((id: string) => ({
+      id,
+      title: id.replace(/_/g, " "),
+      priority: 50,
+      char_count: (secs[id] || "").length,
+    }));
+  };
+
+  const defaultSectionId = (catalog: { id: string; title: string }[]) => {
+    const mda = catalog.find((c) => /mda|management|item\s*7|item\s*2|results of operations/i.test(c.title));
+    if (mda) return mda.id;
+    const risk = catalog.find((c) => /risk/i.test(c.title));
+    if (risk) return risk.id;
+    return catalog[0]?.id || "";
+  };
 
   // Fetch full details of a processed report and hydrate UI
   const selectReport = useCallback(async (id: string, companyName: string) => {
     setActiveReportId(id);
     setProcessingStatus("complete");
     try {
-      const res = await fetch(`http://localhost:8000/api/reports/${id}`);
+      const res = await fetch(apiUrl(`/api/reports/${id}`));
       if (res.ok) {
         const fullReport = await res.json();
         setActiveReport(fullReport);
+        const catalog = getSectionCatalog(fullReport);
+        setActiveFilingTab(defaultSectionId(catalog));
         setPipelineLogs(fullReport.logs || []);
         setCurrentStep(fullReport.current_step || "Complete");
         setChatMessages([{
           id: 1, role: "assistant",
-          content: `Analysis of ${fullReport.company_name}'s filing is complete. Ask me about risks, margins, sentiment, or competitor comparisons.`,
+          content: `Earnings narrative analysis for ${fullReport.company_name} is complete. Ask about MD&A tone, operational risks, supply chain, or peer comparisons.`,
           citations: []
         }]);
       }
@@ -129,60 +157,120 @@ export default function Home() {
     const formData = new FormData();
     formData.append("file", new File([blob], `${company}_10K_2025.pdf`, { type: "application/pdf" }));
     formData.append("company_name", company);
-    formData.append("user_query", "Analyze all risks and sentiment. Compare against key industry peers and generate competitive benchmarks.");
+    formData.append("user_query", "Extract operational risks and negative sentiment shifts from MD&A and narrative sections. Compare against key industry peers.");
     await runUploadAndPoll(formData, company);
   };
 
-  // Promise-based poll: resolves only when backend status = complete or failed
+  // Poll /status while the background LangGraph job runs (not a backend bug).
+  const pipelinePollTimeoutMs = Number(
+    process.env.NEXT_PUBLIC_PIPELINE_POLL_TIMEOUT_MS ?? 900_000
+  );
+
   const pollUntilComplete = useCallback((repId: string): Promise<void> => {
     return new Promise((resolve, reject) => {
-      const iv = setInterval(async () => {
+      let delayMs = 800;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+      let stopped = false;
+      const timeoutMinutes = Math.round(pipelinePollTimeoutMs / 60_000);
+
+      const stop = (fn: () => void) => {
+        if (stopped) return;
+        stopped = true;
+        if (timeoutId) clearTimeout(timeoutId);
+        fn();
+      };
+
+      const pollOnce = async () => {
+        if (stopped) return;
         try {
-          const r = await fetch(`http://localhost:8000/api/reports/${repId}/status`);
-          if (!r.ok) { clearInterval(iv); reject(); return; }
+          const r = await fetch(apiUrl(`/api/reports/${repId}/status`));
+          if (!r.ok) {
+            stop(() => reject(new Error("Status poll failed")));
+            return;
+          }
           const d = await r.json();
           setPipelineLogs(d.logs || []);
           setCurrentStep(d.current_step || "Processing...");
-          if (d.status === "complete") { clearInterval(iv); resolve(); }
-          else if (d.status === "failed") { clearInterval(iv); reject(new Error("Pipeline failed")); }
-        } catch (e) { clearInterval(iv); reject(e); }
-      }, 900);
-      // Safety timeout after 5 minutes
-      setTimeout(() => { clearInterval(iv); resolve(); }, 300_000);
+          if (d.status === "complete") {
+            stop(resolve);
+            return;
+          }
+          if (d.status === "failed") {
+            stop(() => reject(new Error("Pipeline failed")));
+            return;
+          }
+        } catch (e) {
+          stop(() => reject(e));
+          return;
+        }
+        delayMs = Math.min(delayMs + 500, 4000);
+        timeoutId = setTimeout(pollOnce, delayMs);
+      };
+
+      pollOnce();
+      setTimeout(() => {
+        stop(() =>
+          reject(
+            new Error(
+              `Pipeline timed out after ${timeoutMinutes} minutes — check backend logs; the job may still be running.`
+            )
+          )
+        );
+      }, pipelinePollTimeoutMs);
     });
-  }, []);
+  }, [pipelinePollTimeoutMs]);
 
   // Shared upload+poll handler used by templates and file upload
   const runUploadAndPoll = async (formData: FormData, companyHint: string) => {
     setProcessingStatus("processing");
-    setPipelineLogs(["Uploading filing to Aegis backend..."]);
+    setPipelineLogs(["Sending PDF to backend..."]);
     setCurrentStep("Uploading...");
     setActiveReport(null);
     setCompareStatus("idle");
     try {
-      const r = await fetch("http://localhost:8000/api/upload", { method: "POST", body: formData });
-      if (!r.ok) { const e = await r.json(); throw new Error(e.detail || "Upload failed"); }
-      const { report_id, company_name } = await r.json();
+      const r = await fetch(apiUrl("/api/upload"), { method: "POST", body: formData });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        throw new Error(
+          typeof body.detail === "string"
+            ? body.detail
+            : body.detail?.[0]?.msg || "Upload failed — is the backend running on port 8000?"
+        );
+      }
+      const { report_id, company_name } = body;
       setActiveReportId(report_id);
+      setPipelineLogs([
+        "Upload accepted by API.",
+        "Extracting PDF and running pipeline — live logs will appear below.",
+        "Large filings (35–40 pages) can take 5–15 minutes.",
+      ]);
+      setCurrentStep("Queued — extracting & analyzing...");
       await pollUntilComplete(report_id);
       await selectReport(report_id, company_name || companyHint);
-      const listRes = await fetch("http://localhost:8000/api/reports");
+      const listRes = await fetch(apiUrl("/api/reports"));
       if (listRes.ok) setReportsList(await listRes.json());
     } catch (err: any) {
       setProcessingStatus("failed");
       setCurrentStep(`Error: ${err.message}`);
+      setPipelineLogs(prev => [...prev, `❌ ${err.message}`]);
       console.error(err);
     }
   };
 
   // Handle actual PDF file uploads
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
     if (!file) return;
+    if (processingStatus === "processing") return;
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("user_query", "Analyze all operational risks and sentiment. Compare against key industry competitors and generate comprehensive benchmarks.");
-    await runUploadAndPoll(formData, file.name.replace(/\.pdf$/i, ""));
+    formData.append("user_query", "Earnings report risk and sentiment extraction: emphasize MD&A, hidden operational risks, and forward challenges vs headline numbers.");
+    try {
+      await runUploadAndPoll(formData, file.name.replace(/\.pdf$/i, ""));
+    } finally {
+      input.value = "";
+    }
   };
 
   // Triggers comparative re-analysis with custom prompt
@@ -196,17 +284,8 @@ export default function Home() {
     setCurrentStep("Re-triggering pipeline...");
     setPipelineLogs(prev => [...prev, `💡 Re-triggering pipeline with query: "${retriggerQuery}"`]);
 
-    if (useSimulator) {
-      setTimeout(() => {
-        setIsRetriggering(false);
-        setProcessingStatus("complete");
-        setRetriggerQuery("");
-      }, 2000);
-      return;
-    }
-
     try {
-      const res = await fetch("http://localhost:8000/api/reports/trigger", {
+      const res = await fetch(apiUrl("/api/reports/trigger"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -214,16 +293,20 @@ export default function Home() {
           query: retriggerQuery
         })
       });
-      
-      if (res.ok) {
-        setRetriggerQuery("");
-        setIsRetriggering(false);
-        pollBackendStatus(activeReportId, activeReport?.company_name || "Target");
+
+      if (!res.ok) {
+        throw new Error("Re-trigger request failed");
       }
+
+      setRetriggerQuery("");
+      setProcessingStatus("processing");
+      await pollUntilComplete(activeReportId);
+      await selectReport(activeReportId, activeReport?.company_name || "Target");
+      setIsRetriggering(false);
     } catch (err) {
       console.error("Error retriggering backend:", err);
       setIsRetriggering(false);
-      setProcessingStatus("complete");
+      setProcessingStatus("failed");
     }
   };
 
@@ -240,7 +323,7 @@ export default function Home() {
     setChatMessages(prev => [...prev, { id: newId, role: "user", content: userMsg }]);
 
     try {
-      const res = await fetch("http://localhost:8000/api/chat", {
+      const res = await fetch(apiUrl("/api/chat"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -270,8 +353,9 @@ export default function Home() {
     setActiveEvidenceText(evidenceText);
     setActiveHighlightId(highlightId);
     
-    // Auto toggle to Risk Factors tab since most evidence lives there
-    setActiveFilingTab("risk_factors");
+    const catalog = activeReport ? getSectionCatalog(activeReport) : [];
+    const riskSec = catalog.find((c: { title: string }) => /risk/i.test(c.title));
+    setActiveFilingTab(riskSec?.id || defaultSectionId(catalog) || activeFilingTab);
     
     // Smooth scrolling inside the filing viewer
     setTimeout(() => {
@@ -287,7 +371,7 @@ export default function Home() {
     if (!text) return <p className="text-slate-500 italic">No text extracted for this section.</p>;
     
     // If there's active evidence click, wrap that exact match in a neon-violet active bubble
-    if (activeEvidenceText && tab === "risk_factors") {
+    if (activeEvidenceText && tab === activeFilingTab) {
       const cleanEvidence = activeEvidenceText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); // Escape regex chars
       try {
         const regex = new RegExp(`(${cleanEvidence})`, "i");
@@ -379,7 +463,7 @@ export default function Home() {
             <h1 className="text-xl font-bold tracking-tight bg-gradient-to-r from-white via-indigo-200 to-purple-400 bg-clip-text text-transparent flex items-center gap-2">
               AEGIS <span className="text-xs font-semibold px-2 py-0.5 rounded bg-indigo-900/50 text-indigo-300 border border-indigo-500/30">FINANCIAL AGENT</span>
             </h1>
-            <p className="text-xs text-indigo-300/60 font-light">AI-Powered SEC Filing Audit & Comparative Intelligence Platform</p>
+            <p className="text-xs text-indigo-300/60 font-light">Earnings Report Risk &amp; Sentiment Extractor — 10-Q / 10-K narrative intelligence</p>
           </div>
         </div>
 
@@ -595,32 +679,22 @@ export default function Home() {
               )}
             </div>
 
-            {/* Section selection tabs */}
-            <div className="flex space-x-1 mb-4 bg-slate-950/50 p-1 rounded-lg border border-indigo-950/40">
-              <button
-                onClick={() => { setActiveFilingTab("risk_factors"); setActiveEvidenceText(null); }}
-                className={`flex-1 text-center py-2 rounded text-xs font-medium transition ${
-                  activeFilingTab === "risk_factors" ? "bg-indigo-900/40 text-white border border-indigo-500/20" : "text-slate-400 hover:text-white"
-                }`}
-              >
-                Risk Factors (1A)
-              </button>
-              <button
-                onClick={() => { setActiveFilingTab("mda"); setActiveEvidenceText(null); }}
-                className={`flex-1 text-center py-2 rounded text-xs font-medium transition ${
-                  activeFilingTab === "mda" ? "bg-indigo-900/40 text-white border border-indigo-500/20" : "text-slate-400 hover:text-white"
-                }`}
-              >
-                MD&A (Item 7)
-              </button>
-              <button
-                onClick={() => { setActiveFilingTab("forward_looking"); setActiveEvidenceText(null); }}
-                className={`flex-1 text-center py-2 rounded text-xs font-medium transition ${
-                  activeFilingTab === "forward_looking" ? "bg-indigo-900/40 text-white border border-indigo-500/20" : "text-slate-400 hover:text-white"
-                }`}
-              >
-                Forward-Looking
-              </button>
+            {/* PDF-specific section tabs (discovered from filing structure) */}
+            <div className="flex flex-wrap gap-1 mb-4 bg-slate-950/50 p-1 rounded-lg border border-indigo-950/40 max-h-24 overflow-y-auto">
+              {getSectionCatalog(activeReport).map((sec: { id: string; title: string; priority?: number }) => (
+                <button
+                  key={sec.id}
+                  onClick={() => { setActiveFilingTab(sec.id); setActiveEvidenceText(null); }}
+                  className={`text-center py-1.5 px-2 rounded text-[10px] font-medium transition shrink-0 ${
+                    activeFilingTab === sec.id
+                      ? "bg-indigo-900/40 text-white border border-indigo-500/20"
+                      : "text-slate-400 hover:text-white border border-transparent"
+                  }`}
+                  title={sec.title}
+                >
+                  {sec.title.length > 28 ? `${sec.title.slice(0, 26)}…` : sec.title}
+                </button>
+              ))}
             </div>
 
             {/* Text Viewer Content */}
@@ -634,7 +708,10 @@ export default function Home() {
                   <p className="text-xs text-slate-400">Filing narrative will display here once processed. Select a template above to see standard output.</p>
                 </div>
               ) : (
-                renderHighlightedText(activeReport.result.sections[activeFilingTab], activeFilingTab)
+                renderHighlightedText(
+                  activeReport.result.sections?.[activeFilingTab] || "",
+                  activeFilingTab
+                )
               )}
             </div>
           </div>
@@ -652,9 +729,31 @@ export default function Home() {
                 <p className="text-xs text-slate-400">Sentiment analysis will populate when a report is loaded.</p>
               </div>
             ) : (
-              <div className="flex-1 grid grid-cols-12 gap-4 items-center">
+              <div className="flex-1 flex flex-col gap-3 overflow-y-auto">
+              {activeReport.result?.mda_summary && (
+                <div className="bg-indigo-950/30 border border-indigo-800/40 rounded-lg p-3 text-[11px] text-slate-300 leading-relaxed">
+                  <span className="text-[9px] font-semibold text-indigo-400 uppercase tracking-wider block mb-1">MD&amp;A takeaway</span>
+                  {activeReport.result.mda_summary}
+                </div>
+              )}
+              {(activeReport.result?.future_challenges ?? []).length > 0 && (
+                <div className="bg-red-950/20 border border-red-900/30 rounded-lg p-3">
+                  <span className="text-[9px] font-semibold text-red-300 uppercase tracking-wider block mb-1">Forward challenges (narrative)</span>
+                  <ul className="text-[10px] text-slate-400 space-y-1 list-disc pl-4">
+                    {activeReport.result.future_challenges.slice(0, 5).map((fc: string, i: number) => (
+                      <li key={i}>{fc}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {activeReport.result?.sentiment_shift_notes && (
+                <p className="text-[10px] text-amber-300/90 border-l-2 border-amber-500 pl-2">
+                  {activeReport.result.sentiment_shift_notes}
+                </p>
+              )}
+              <div className="grid grid-cols-12 gap-4 items-center shrink-0">
                 {/* Score Card Panel */}
-                <div className="col-span-12 md:col-span-4 bg-indigo-950/20 border border-indigo-900/40 rounded-xl p-4 flex flex-col items-center justify-center text-center relative overflow-hidden h-full">
+                <div className="col-span-12 md:col-span-4 bg-indigo-950/20 border border-indigo-900/40 rounded-xl p-4 flex flex-col items-center justify-center text-center relative overflow-hidden h-full min-h-[140px]">
                   <div className="absolute top-0 inset-x-0 h-1 bg-gradient-to-r from-blue-500 to-purple-500" />
                   
                   <span className="text-[10px] text-indigo-300 font-semibold tracking-wider uppercase mb-1">Net Tone Score</span>
@@ -700,6 +799,7 @@ export default function Home() {
                     </ResponsiveContainer>
                   </div>
                 </div>
+              </div>
               </div>
             )}
           </div>
@@ -755,7 +855,7 @@ export default function Home() {
                           risk.severity === "Medium" ? "bg-amber-950 text-amber-300 border border-amber-500/20" :
                           "bg-slate-900 text-slate-300 border border-slate-700/50"
                         }`}>
-                          {risk.severity.toUpperCase()}
+                          {(risk.severity ?? "Low").toUpperCase()}
                         </span>
                       </div>
 
@@ -822,7 +922,7 @@ export default function Home() {
                       setCompareStatus("loading");
                       setCompareTarget(company);
                       try {
-                        const res = await fetch("http://localhost:8000/api/reports/trigger", {
+                        const res = await fetch(apiUrl("/api/reports/trigger"), {
                           method: "POST",
                           headers: { "Content-Type": "application/json" },
                           body: JSON.stringify({

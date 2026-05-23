@@ -1,9 +1,25 @@
-import os
 import hashlib
-import numpy as np
 import logging
 
+import numpy as np
+
+from backend.config import get_settings
+
 logger = logging.getLogger(__name__)
+
+
+def _as_flat_embedding(vector) -> list:
+    """Return a single flat embedding vector (list of floats)."""
+    if hasattr(vector, "tolist"):
+        data = vector.tolist()
+    else:
+        data = list(vector)
+    while data and isinstance(data[0], list):
+        if len(data) != 1:
+            break
+        data = data[0]
+    return data
+
 
 def get_mock_embedding(text: str, dim: int = 1024) -> list:
     """
@@ -43,18 +59,19 @@ class EmbeddingManager:
         # We try to load sentence-transformers. 
         # Since BAAI/bge-large-en-v1.5 is a large model (1.34 GB), we will load it lazily or support fallback
         try:
-            # Check if we explicitly want to skip loading heavy models for speed
-            if os.environ.get("USE_MOCK_EMBEDDINGS", "false").lower() == "true":
+            settings = get_settings()
+            if settings.use_mock_embeddings:
                 logger.info("USE_MOCK_EMBEDDINGS is active. Using semantic mock embeddings.")
                 self.use_fallback = True
                 self.initialized = True
                 return
 
             from sentence_transformers import SentenceTransformer
-            logger.info("Initializing SentenceTransformer 'BAAI/bge-large-en-v1.5'...")
-            # We set a short timeout or just load.
-            self.model = SentenceTransformer("BAAI/bge-large-en-v1.5", trust_remote_code=True)
-            logger.info("SentenceTransformer BAAI/bge-large-en-v1.5 loaded successfully.")
+
+            model_name = settings.embedding_model
+            logger.info("Initializing SentenceTransformer '%s'...", model_name)
+            self.model = SentenceTransformer(model_name, trust_remote_code=True)
+            logger.info("SentenceTransformer %s loaded successfully.", model_name)
         except Exception as e:
             logger.warning(f"Could not load SentenceTransformer: {str(e)}. Using high-fidelity semantic fallback.")
             self.use_fallback = True
@@ -62,20 +79,36 @@ class EmbeddingManager:
         self.initialized = True
 
     def get_embedding(self, text: str) -> list:
+        batch = self.get_embeddings([text])
+        return batch[0] if batch else []
+
+    def get_embeddings(self, texts: list) -> list:
         if not self.initialized:
             self.initialize()
-            
+
+        if not texts:
+            return []
+
         if self.use_fallback or self.model is None:
-            return get_mock_embedding(text)
-            
+            return [get_mock_embedding(t) for t in texts]
+
         try:
-            embedding = self.model.encode(text)
-            if hasattr(embedding, 'tolist'):
-                return embedding.tolist()
-            return list(embedding)
+            vectors = self.model.encode(
+                texts,
+                batch_size=min(32, len(texts)),
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+            if getattr(vectors, "ndim", None) == 1:
+                return [_as_flat_embedding(vectors)]
+            if getattr(vectors, "ndim", None) == 2:
+                return [_as_flat_embedding(row) for row in vectors]
+            if hasattr(vectors, "__iter__"):
+                return [_as_flat_embedding(row) for row in vectors]
+            return [_as_flat_embedding(vectors)]
         except Exception as e:
-            logger.error(f"Error encoding text embedding: {str(e)}. Falling back.")
-            return get_mock_embedding(text)
+            logger.error("Error encoding batch embeddings: %s. Falling back.", e)
+            return [get_mock_embedding(t) for t in texts]
 
 # Singleton helper
 embedding_manager = EmbeddingManager()

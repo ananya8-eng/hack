@@ -1,151 +1,224 @@
+import logging
 import os
 import re
-import logging
+from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+
 import requests
 from bs4 import BeautifulSoup
 
+from backend.config import get_settings
+
 logger = logging.getLogger(__name__)
 
-# ─── Small curated corpus for known tickers (real representative text) ───────
-# Used as fallback when SEC Edgar download is unavailable or rate-limited.
-# ALL other companies fall through to a generic dynamic fallback.
-_CORPUS = {
-    "AMD": (
-        "ITEM 1A. RISK FACTORS. We face intense competition from NVIDIA in graphics processors "
-        "and high-performance computing, and from Intel in microprocessors. We rely on TSMC for "
-        "all semiconductor wafer fabrication. Supply chain disruptions, advanced packaging capacity "
-        "constraints at TSMC (CoWoS), and export controls on high-performance chips to China "
-        "present substantial operating risks. Our Data Center segment grew 80% year-over-year "
-        "driven by Instinct MI300X GPU accelerators. Gross margin expanded to 47% on a GAAP basis. "
-        "Gaming segment revenue declined 48% due to lower console chip demand. R&D expenses rose "
-        "15% as we accelerate next-generation AI roadmaps."
-    ),
-    "INTC": (
-        "ITEM 1A. RISK FACTORS. We are undergoing a massive transformation to establish Intel "
-        "Foundry Services (IFS) as a leading standalone semiconductor foundry. This requires "
-        "extremely high capital expenditure in fabs in Oregon, Ohio, Arizona, Germany, and Ireland. "
-        "We face intense competition from AMD in client and server CPUs and our share in the AI "
-        "accelerator market remains small relative to NVIDIA. Server CPU market share losses and "
-        "slow turnaround in enterprise data centers impacted revenues. Operating margins declined "
-        "due to high startup costs and depreciation from our 5-nodes-in-4-years manufacturing roadmap."
-    ),
-    "INTEL": (
-        "ITEM 1A. RISK FACTORS. Intel Foundry Services faces high capital intensity and yield risks "
-        "at Intel 18A advanced node. Competition from AMD in CPUs and NVIDIA in GPUs continues to "
-        "intensify. Server CPU market share losses and slow enterprise recovery impacted revenues. "
-        "High depreciation from manufacturing infrastructure build-out compressed operating margins."
-    ),
-    "NVDA": (
-        "ITEM 1A. RISK FACTORS. We rely on TSMC for all semiconductor fabrication. Any disruptions "
-        "in Taiwan, CoWoS advanced packaging shortages, or export restrictions on H100/A100 GPUs "
-        "to China materially impact revenues. Data Center revenues surged 250% driven by AI/LLM demand. "
-        "Gross margins reached a record 74% driven by CUDA software ecosystem pricing power. "
-        "Competition from AMD Instinct and open-source ROCm represents a strategic risk to our "
-        "software moat. Export controls force us to design lower-performance A800/H800 alternatives."
-    ),
-    "TSMC": (
-        "ITEM 1A. RISK FACTORS. TSMC faces geopolitical risks due to concentration of manufacturing "
-        "in Taiwan. Advanced node yield ramp at N2 and N3 requires significant capital expenditure. "
-        "Customer concentration risk exists with Apple and NVIDIA representing large revenue shares. "
-        "Capacity expansion in Arizona and Japan exposes us to higher cost structures and operational risks. "
-        "CoWoS advanced packaging demand far exceeds current capacity, requiring significant investment."
-    ),
-    "QCOM": (
-        "ITEM 1A. RISK FACTORS. Qualcomm faces significant risks from handset market cyclicality and "
-        "Apple's potential vertical integration of baseband chips. Licensing revenue faces litigation "
-        "risk. Snapdragon diversification into automotive and IoT markets is underway but not yet "
-        "a material revenue contributor. Export restrictions on chips to China and Huawei specifically "
-        "reduce addressable market. TSMC fabrication dependency creates supply chain concentration risk."
-    ),
-    "AAPL": (
-        "ITEM 1A. RISK FACTORS. Apple's revenue is concentrated in iPhone product cycles which are "
-        "sensitive to consumer spending and component supply chains. Dependence on TSMC for Apple "
-        "Silicon manufacturing represents a single-source risk. Services segment growth faces "
-        "regulatory headwinds from antitrust investigations in EU and US. China represents a "
-        "major revenue market subject to geopolitical and regulatory risks. Competition in wearables "
-        "and services is intensifying from Google, Samsung, and other players."
-    ),
-    "MSFT": (
-        "ITEM 1A. RISK FACTORS. Microsoft faces intense competition in cloud services from AWS and "
-        "Google Cloud. AI integration across products (Copilot) requires significant capital investment "
-        "in data centers and GPU procurement. Regulatory scrutiny around acquisitions (Activision) "
-        "and AI market competition is increasing. Cybersecurity incidents could materially impact "
-        "trust in cloud services. Azure growth faces macro headwinds from enterprise IT budget cycles."
-    ),
-    "GOOGL": (
-        "ITEM 1A. RISK FACTORS. Alphabet faces existential risk to search advertising from AI-powered "
-        "alternatives. Google Cloud competes intensely with AWS and Azure for enterprise workloads. "
-        "Regulatory pressure around advertising monopoly and AI practices is increasing globally. "
-        "YouTube monetization faces competition from TikTok and short-form video platforms. "
-        "Waymo autonomous driving represents a long-horizon investment with uncertain profitability."
-    ),
-    "TSLA": (
-        "ITEM 1A. RISK FACTORS. Tesla faces intensifying competition from BYD and legacy automakers "
-        "transitioning to EVs. Margin pressure from price cuts required to maintain volume growth "
-        "is compressing automotive gross margins. Dependency on lithium and battery supply chain "
-        "creates procurement risk. CEO concentration risk and social media activity represent "
-        "reputational risks. Full Self-Driving regulatory approval is uncertain and highly litigated."
-    ),
-    "SAMSUNG": (
-        "ITEM 1A. RISK FACTORS. Samsung Electronics faces competitive pressure in memory chips (DRAM, NAND) "
-        "from SK Hynix and Micron. The foundry business competes with TSMC for advanced node customers. "
-        "HBM3 high-bandwidth memory production ramp for AI customers is critical for revenue growth. "
-        "Mobile division faces smartphone market saturation and competition from Apple and Chinese OEMs. "
-        "Geopolitical exposure between US-China technology restrictions affects customer dynamics."
-    ),
+_SEC_TICKERS_CACHE: Optional[Dict[str, str]] = None
+_VALID_TICKERS: Optional[set[str]] = None
+
+# Common brand/name → SEC ticker (LLM often outputs these incorrectly)
+_TICKER_ALIASES: Dict[str, str] = {
+    "APPLE": "AAPL",
+    "GOOGLE": "GOOGL",
+    "ALPHABET": "GOOGL",
+    "FACEBOOK": "META",
+    "AMAZON": "AMZN",
+    "MICROSOFT": "MSFT",
+    "NVIDIA": "NVDA",
+    "TESLA": "TSLA",
+    "NETFLIX": "NFLX",
 }
 
 
 class FinancialScraper:
-    def __init__(self, download_dir: str = "./scraped_filings"):
-        self.download_dir = download_dir
-        os.makedirs(download_dir, exist_ok=True)
+    def __init__(self, download_dir: str | None = None):
+        settings = get_settings()
+        self.download_dir = download_dir or settings.scraped_filings_dir
+        self._user_agent = settings.scraper_user_agent
+        self._sec_company = settings.sec_edgar_company_name
+        self._sec_email = settings.sec_edgar_email
+        os.makedirs(self.download_dir, exist_ok=True)
 
     def scrape_url(self, url: str) -> str:
         """Scrapes a webpage using BeautifulSoup and returns clean text."""
         try:
-            headers = {"User-Agent": "Mozilla/5.0 AegisFinancialAgent/1.0"}
-            response = requests.get(url, headers=headers, timeout=10)
+            headers = {"User-Agent": self._user_agent}
+            response = requests.get(url, headers=headers, timeout=15)
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, "html.parser")
-                for tag in soup(["script", "style", "nav", "footer"]):
+                for tag in soup(["script", "style", "nav", "footer", "header"]):
                     tag.decompose()
                 lines = (line.strip() for line in soup.get_text().splitlines())
-                return "\n".join(l for l in lines if l)
+                return "\n".join(line for line in lines if line)
         except Exception as e:
-            logger.debug(f"URL scrape failed {url}: {e}")
+            logger.debug("URL scrape failed %s: %s", url, e)
         return ""
 
+    def _load_sec_tickers(self) -> None:
+        global _SEC_TICKERS_CACHE, _VALID_TICKERS
+        if _SEC_TICKERS_CACHE is not None:
+            return
+        _SEC_TICKERS_CACHE = {}
+        _VALID_TICKERS = set()
+        try:
+            resp = requests.get(
+                "https://www.sec.gov/files/company_tickers.json",
+                headers={"User-Agent": f"{self._sec_company} {self._sec_email}"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for entry in data.values():
+                title = str(entry.get("title", "")).strip()
+                ticker = str(entry.get("ticker", "")).strip().upper()
+                if title and ticker:
+                    _SEC_TICKERS_CACHE[title.upper()] = ticker
+                    _SEC_TICKERS_CACHE[ticker] = ticker
+                    _VALID_TICKERS.add(ticker)
+        except Exception as e:
+            logger.warning("SEC ticker lookup unavailable: %s", e)
+
+    def resolve_ticker(self, company: str) -> str:
+        """Resolve a company name or ticker via SEC company_tickers.json."""
+        raw = company.strip()
+        if not raw:
+            return ""
+
+        self._load_sec_tickers()
+        key = raw.upper().replace(",", "").strip()
+
+        if key in _TICKER_ALIASES:
+            return _TICKER_ALIASES[key]
+
+        first_token = key.split()[0] if key.split() else ""
+        if first_token in _TICKER_ALIASES:
+            return _TICKER_ALIASES[first_token]
+
+        if _VALID_TICKERS and key in _VALID_TICKERS:
+            return key
+
+        if _SEC_TICKERS_CACHE and key in _SEC_TICKERS_CACHE:
+            return _SEC_TICKERS_CACHE[key]
+
+        if _SEC_TICKERS_CACHE:
+            for title, ticker in _SEC_TICKERS_CACHE.items():
+                if title == key:
+                    continue
+                if re.search(rf"\b{re.escape(key)}\b", title):
+                    return ticker
+                if key in title:
+                    return ticker
+
+        if re.fullmatch(r"[A-Z]{1,5}", key):
+            logger.warning(
+                "Could not resolve '%s' to a known SEC ticker; download may fail",
+                company,
+            )
+            return key
+
+        return key.upper().replace(" ", "_")[:8]
+
+    def _duckduckgo_result_urls(self, query: str, max_results: int = 3) -> List[str]:
+        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        headers = {"User-Agent": self._user_agent}
+        try:
+            response = requests.post(search_url, headers=headers, timeout=15)
+            response.raise_for_status()
+        except Exception as e:
+            logger.warning("Web search request failed: %s", e)
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        urls: List[str] = []
+        for link in soup.select("a.result__a"):
+            href = link.get("href", "")
+            if not href:
+                continue
+            if "uddg=" in href:
+                parsed = urlparse(href)
+                qs = parse_qs(parsed.query)
+                uddg = qs.get("uddg", [""])[0]
+                href = unquote(uddg) if uddg else href
+            if href.startswith("http") and href not in urls:
+                urls.append(href)
+            if len(urls) >= max_results:
+                break
+        return urls
+
+    def web_search(self, query: str, company: str = "", max_results: int = 3) -> dict:
+        """
+        Run a natural-language web search, scrape top result pages, and return combined text.
+        Example query: "what is google's top 5 competitors?"
+        """
+        logger.info("Web search: %s", query[:120])
+        urls = self._duckduckgo_result_urls(query, max_results=max_results)
+        if not urls:
+            return {
+                "success": False,
+                "source": f"Web Search (no results): {query[:80]}",
+                "text": "",
+                "company": (company or "EXTERNAL").upper(),
+                "filing_type": "WEB",
+                "search_query": query,
+            }
+
+        parts: List[str] = []
+        used_urls: List[str] = []
+        for url in urls:
+            page_text = self.scrape_url(url)
+            if len(page_text.strip()) < 200:
+                continue
+            parts.append(f"--- Source: {url} ---\n{page_text[:6000]}")
+            used_urls.append(url)
+
+        combined = "\n\n".join(parts)
+        label = (company or "EXTERNAL").upper().strip() or "EXTERNAL"
+        return {
+            "success": bool(combined.strip()),
+            "source": f"Web Search ({query[:60]})",
+            "text": combined[:18000],
+            "company": label,
+            "filing_type": "WEB",
+            "search_query": query,
+            "urls": used_urls,
+        }
+
     def fetch_sec_filing(self, company: str, filing_type: str = "10-K") -> dict:
-        """
-        Fetches a financial filing for any company.
+        """Fetch a filing from SEC EDGAR for any resolvable company/ticker."""
+        ticker = self.resolve_ticker(company)
+        filing_upper = filing_type.upper().strip() or "10-K"
+        logger.info("Fetching %s filing for: %s (%s)", filing_upper, company, ticker)
 
-        Priority order:
-        1. SEC EDGAR live download (real filing)
-        2. Curated local corpus (for well-known tickers)
-        3. Dynamic fallback context (for any other company)
-        """
-        ticker = company.upper().strip()
-        filing_upper = filing_type.upper().strip()
-        logger.info(f"Fetching {filing_upper} filing for: {ticker}")
-
-        # ── 1. Try SEC EDGAR live download ────────────────────────────────────
         try:
             from sec_edgar_downloader import Downloader
-            dl = Downloader("AegisFinancialAgent", "aegis@financialintel.ai", self.download_dir)
+
+            dl = Downloader(
+                self._sec_company,
+                self._sec_email,
+                self.download_dir,
+            )
             count = dl.get(filing_upper, ticker, limit=1)
             if count > 0:
-                base = os.path.join(self.download_dir, "sec-edgar-filings", ticker, filing_upper)
+                base = os.path.join(
+                    self.download_dir, "sec-edgar-filings", ticker, filing_upper
+                )
                 if os.path.isdir(base):
                     for root, _, files in os.walk(base):
-                        for f in files:
-                            if f.endswith((".txt", ".html")):
-                                with open(os.path.join(root, f), "r", encoding="utf-8", errors="ignore") as fh:
+                        for fname in files:
+                            if fname.endswith((".txt", ".html")):
+                                path = os.path.join(root, fname)
+                                with open(
+                                    path, "r", encoding="utf-8", errors="ignore"
+                                ) as fh:
                                     raw = fh.read()
-                                text = BeautifulSoup(raw, "html.parser").get_text() if f.endswith(".html") else raw
-                                # Trim to a reasonable analysis window
+                                if fname.endswith(".html"):
+                                    text = BeautifulSoup(raw, "html.parser").get_text()
+                                else:
+                                    text = raw
                                 text = " ".join(text.split())[:12000]
-                                logger.info(f"SEC Edgar live filing retrieved for {ticker} ({len(text)} chars)")
+                                logger.info(
+                                    "SEC Edgar filing retrieved for %s (%s chars)",
+                                    ticker,
+                                    len(text),
+                                )
                                 return {
                                     "success": True,
                                     "source": f"SEC EDGAR Live ({ticker} {filing_upper})",
@@ -154,46 +227,51 @@ class FinancialScraper:
                                     "filing_type": filing_upper,
                                 }
         except Exception as e:
-            logger.warning(f"SEC Edgar download failed for {ticker}: {e}")
-
-        # ── 2. Curated corpus lookup ───────────────────────────────────────────
-        corpus_text = _CORPUS.get(ticker)
-        if corpus_text:
-            logger.info(f"Using curated corpus for {ticker}")
+            logger.warning("SEC Edgar download failed for %s: %s", ticker, e)
             return {
-                "success": True,
-                "source": f"Curated Financial Archive ({ticker} {filing_upper})",
-                "text": corpus_text,
+                "success": False,
+                "source": f"SEC EDGAR ({ticker} {filing_upper})",
+                "text": "",
                 "company": ticker,
                 "filing_type": filing_upper,
+                "error": str(e),
+                "resolved_ticker": ticker,
+                "input_company": company,
             }
 
-        # ── 3. Generic dynamic fallback for any other company ─────────────────
-        # Build a realistic-sounding context paragraph from the company name
-        logger.info(f"Generating dynamic industry fallback context for {ticker}")
-        dynamic_text = (
-            f"ITEM 1A. RISK FACTORS. {company} operates in competitive global markets and faces "
-            f"risks including macroeconomic headwinds, supply chain disruptions, technology obsolescence, "
-            f"regulatory compliance challenges, and intensifying competition from established and emerging players. "
-            f"The company relies on third-party suppliers and manufacturing partners which introduces single-source "
-            f"concentration risk. Currency fluctuations, geopolitical tensions, and export restrictions in key "
-            f"markets add operational uncertainty. Research and development investments are required to maintain "
-            f"competitive product positioning. Customer concentration risk exists if top customers reduce orders. "
-            f"Intellectual property protection and litigation represent ongoing legal exposure.\n\n"
-            f"ITEM 7. MD&A. {company} has shown revenue trajectory in its core business segments. "
-            f"Management continues to invest in operational efficiency and new product development. "
-            f"Capital allocation priorities include organic growth, strategic acquisitions, and shareholder returns. "
-            f"Gross margins are influenced by product mix, pricing power, and input cost dynamics. "
-            f"The company maintains a disciplined approach to cost management while pursuing long-term growth opportunities."
-        )
         return {
-            "success": True,
-            "source": f"Dynamic Industry Context ({ticker})",
-            "text": dynamic_text,
+            "success": False,
+            "source": f"SEC EDGAR ({ticker} {filing_upper})",
+            "text": "",
             "company": ticker,
             "filing_type": filing_upper,
+            "error": "No filing files found after download",
+            "resolved_ticker": ticker,
+            "input_company": company,
         }
 
+    def execute_scrape_request(self, request: Dict[str, Any]) -> dict:
+        """Run one LLM-planned scrape request (web search, SEC filing, or prior filing)."""
+        req_type = str(request.get("type") or "web_search").lower()
+        company = str(request.get("company") or "").strip()
+        query = str(request.get("query") or "").strip()
+        filing_type = str(request.get("filing_type") or "10-K").strip()
 
-# Singleton
+        if req_type == "web_search":
+            return self.web_search(query, company=company)
+
+        if req_type == "prior_filing":
+            res = self.fetch_sec_filing(company, filing_type)
+            if res.get("success"):
+                res = {
+                    **res,
+                    "company": company.upper(),
+                    "source": f"Prior Period SEC Context ({res.get('company')} {filing_type})",
+                    "filing_type": f"{filing_type}-PRIOR",
+                }
+            return res
+
+        return self.fetch_sec_filing(company, filing_type)
+
+
 financial_scraper = FinancialScraper()
