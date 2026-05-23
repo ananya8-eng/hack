@@ -63,7 +63,7 @@ Dashboard + Chatbot
 | Backend | FastAPI |
 | Agent Framework | LangGraph |
 | Main AI Model | Qwen2.5 3B Instruct |
-| LLM Runtime | nvdia->grok->huggingface->gemini (one serves as fallback when preceeding privider fails) |
+| LLM Runtime | Ollam(locally running) -> nvdia->grok->huggingface->gemini (one serves as fallback when preceeding privider fails) |
 | Embeddings | BAAI/bge-large-en-v1.5 |
 | Vector Database | ChromaDB |
 | PDF Parsing | PyMuPDF |
