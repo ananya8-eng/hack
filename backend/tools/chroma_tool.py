@@ -10,6 +10,7 @@ class ChromaDBManager:
         self.db_path = db_path
         self.client = None
         self.collection = None
+        self.report_collections = {}
         self.use_fallback = False
         self.fallback_db = []  # List of dicts: {"id", "document", "embedding", "metadata"}
 
@@ -22,6 +23,23 @@ class ChromaDBManager:
         except Exception as e:
             logger.warning(f"Failed to initialize ChromaDB: {str(e)}. Switching to high-fidelity In-Memory Vector Store fallback.")
             self.use_fallback = True
+
+    def get_or_create_collection(self, report_id: str = None):
+        if self.use_fallback or self.client is None:
+            return None
+        if not report_id:
+            return self.collection
+        collection_name = self._collection_name(report_id)
+        if collection_name not in self.report_collections:
+            self.report_collections[collection_name] = self.client.get_or_create_collection(collection_name)
+        return self.report_collections[collection_name]
+
+    def delete_collection(self, report_id: str):
+        if self.use_fallback or self.client is None or not report_id:
+            return
+        collection_name = self._collection_name(report_id)
+        self.client.delete_collection(collection_name)
+        self.report_collections.pop(collection_name, None)
 
     def add_chunks(self, chunks: list, metadata_list: list, ids: list):
         """
@@ -56,13 +74,21 @@ class ChromaDBManager:
             return
 
         try:
-            # Add to ChromaDB
             self.collection.upsert(
                 documents=chunks,
                 embeddings=embeddings,
                 metadatas=metadata_list,
                 ids=ids
             )
+            report_id = self._common_report_id(metadata_list)
+            report_collection = self.get_or_create_collection(report_id)
+            if report_collection is not None and report_collection is not self.collection:
+                report_collection.upsert(
+                    documents=chunks,
+                    embeddings=embeddings,
+                    metadatas=metadata_list,
+                    ids=ids
+                )
             logger.info(f"Added {len(chunks)} chunks to ChromaDB.")
         except Exception as e:
             logger.error(f"Error adding to ChromaDB: {str(e)}. Using fallback database.")
@@ -76,9 +102,10 @@ class ChromaDBManager:
         [{"document", "metadata", "score", "id"}]
         """
         query_emb = embedding_manager.get_embedding(query_text)
-        effective_where = self._merge_where(where, report_id)
+        collection = self.get_or_create_collection(report_id) if report_id else self.collection
+        effective_where = self._merge_where(where, report_id, include_report_id=self.use_fallback or collection is self.collection)
 
-        if self.use_fallback or self.collection is None:
+        if self.use_fallback or collection is None:
             # Manual Cosine Similarity search on in-memory database
             results = []
             if not self.fallback_db:
@@ -120,7 +147,7 @@ class ChromaDBManager:
             if effective_where:
                 query_params["where"] = effective_where
 
-            chroma_results = self.collection.query(**query_params)
+            chroma_results = collection.query(**query_params)
             
             formatted_results = []
             if chroma_results and chroma_results.get("documents"):
@@ -159,10 +186,11 @@ class ChromaDBManager:
             return self._summarize_rows([row.get("metadata", {}) for row in rows], len(rows))
 
         try:
-            if where:
-                data = self.collection.get(where=where, include=["metadatas"])
+            collection = self.get_or_create_collection(report_id) if report_id else self.collection
+            if where and collection is self.collection:
+                data = collection.get(where=where, include=["metadatas"])
             else:
-                data = self.collection.get(include=["metadatas"])
+                data = collection.get(include=["metadatas"])
             metadatas = data.get("metadatas") or []
             return self._summarize_rows(metadatas, len(data.get("ids") or []))
         except Exception as e:
@@ -170,9 +198,9 @@ class ChromaDBManager:
             return {"total_chunks": 0, "sections": {}, "companies": {}, "error": str(e)}
 
     @staticmethod
-    def _merge_where(where: dict = None, report_id: str = None) -> dict:
+    def _merge_where(where: dict = None, report_id: str = None, include_report_id: bool = True) -> dict:
         effective_where = dict(where or {})
-        if report_id:
+        if report_id and include_report_id:
             effective_where["report_id"] = report_id
         if len(effective_where) > 1:
             return {"$and": [{key: value} for key, value in effective_where.items()]}
@@ -186,6 +214,16 @@ class ChromaDBManager:
             if metadata.get(key) != value:
                 return False
         return True
+
+    @staticmethod
+    def _common_report_id(metadata_list: list) -> str:
+        report_ids = {metadata.get("report_id") for metadata in metadata_list if metadata.get("report_id")}
+        return report_ids.pop() if len(report_ids) == 1 else None
+
+    @staticmethod
+    def _collection_name(report_id: str) -> str:
+        safe = "".join(ch if ch.isalnum() else "_" for ch in report_id.lower())
+        return f"report_{safe[:48]}"
 
     @staticmethod
     def _summarize_rows(metadatas: list, total: int) -> dict:

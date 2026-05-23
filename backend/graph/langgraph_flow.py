@@ -6,7 +6,7 @@ from langgraph.graph import StateGraph, END
 # Import backend modules
 from backend.ingestion.pdf_extractor import extract_pdf_text
 from backend.extraction.section_extractor import extract_sections
-from backend.rag.chunking import split_text_into_chunks
+from backend.rag.chunking import build_section_chunks, split_text_into_chunks
 from backend.tools.chroma_tool import chromadb_manager
 from backend.agents.financial_agent import financial_agent
 from backend.agents.validator_agent import validator_agent
@@ -66,18 +66,22 @@ def node_ingest_and_chunk(state: AgentState) -> Dict[str, Any]:
     for section_name, text in sections.items():
         if not text:
             continue
-        chunks = split_text_into_chunks(text)
-        if chunks:
-            ids = [f"{report_id}_{company}_{section_name}_{uuid.uuid4().hex[:6]}_{i}" for i in range(len(chunks))]
-            metadata = [
-                {
-                    "report_id": report_id,
-                    "company": company,
-                    "section": section_name,
-                    "chunk_index": i,
-                    "filing_type": "uploaded_filing"
-                }
-                for i in range(len(chunks))
+        chunk_records = build_section_chunks(
+            text,
+            {
+                "report_id": report_id,
+                "company": company,
+                "section": section_name,
+                "section_name": section_name,
+                "filing_type": "uploaded_filing"
+            }
+        )
+        if chunk_records:
+            chunks = [record["text"] for record in chunk_records]
+            metadata = [record["metadata"] for record in chunk_records]
+            ids = [
+                f"{report_id}_{company}_{section_name}_{record['metadata']['parent_chunk_index']}_{record['metadata']['child_chunk_index']}_{uuid.uuid4().hex[:6]}"
+                for record in chunk_records
             ]
             chromadb_manager.add_chunks(chunks, metadata, ids)
             total_indexed += len(chunks)
@@ -177,18 +181,22 @@ def node_validation(state: AgentState) -> Dict[str, Any]:
             })
             
             # Smart bonus: Index competitor chunks in ChromaDB too! This allows comparative chat citations!
-            comp_chunks = split_text_into_chunks(audit_res.get("cleaned_content", ""))
-            if comp_chunks:
-                ids = [f"{report_id}_{doc.get('company')}_competitor_{uuid.uuid4().hex[:6]}_{i}" for i in range(len(comp_chunks))]
-                metadata = [
-                    {
-                        "report_id": report_id,
-                        "company": doc.get("company"),
-                        "section": "competitor_analysis",
-                        "chunk_index": i,
-                        "filing_type": doc.get("filing_type", "10-K")
-                    }
-                    for i in range(len(comp_chunks))
+            comp_records = build_section_chunks(
+                audit_res.get("cleaned_content", ""),
+                {
+                    "report_id": report_id,
+                    "company": doc.get("company"),
+                    "section": "competitor_analysis",
+                    "section_name": "competitor_analysis",
+                    "filing_type": doc.get("filing_type", "10-K")
+                }
+            )
+            if comp_records:
+                comp_chunks = [record["text"] for record in comp_records]
+                metadata = [record["metadata"] for record in comp_records]
+                ids = [
+                    f"{report_id}_{doc.get('company')}_competitor_{record['metadata']['parent_chunk_index']}_{record['metadata']['child_chunk_index']}_{uuid.uuid4().hex[:6]}"
+                    for record in comp_records
                 ]
                 chromadb_manager.add_chunks(comp_chunks, metadata, ids)
         else:

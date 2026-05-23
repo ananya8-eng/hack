@@ -293,22 +293,18 @@ async def chatbot_query_stream(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())
 
     async def _stream():
-        result = rag_chatbot.query_chatbot(
+        import json
+        for event_type, payload in rag_chatbot.stream_chatbot(
             user_question=req.message,
             company_name=company,
             report_id=report_id,
             session_id=session_id,
-        )
-        import json
-        # Stream the answer in small chunks for frontend display
-        answer = result.get("answer", "")
-        chunk_size = 20
-        for i in range(0, len(answer), chunk_size):
-            yield answer[i:i+chunk_size]
-        # Final metadata packet
-        meta = {k: v for k, v in result.items() if k != "answer"}
-        meta["session_id"] = session_id
-        yield "\n__META__" + json.dumps(meta)
+        ):
+            if event_type == "token":
+                yield payload
+            elif event_type == "metadata":
+                payload["session_id"] = session_id
+                yield "\n__META__" + json.dumps(payload)
 
     return StreamingResponse(_stream(), media_type="text/plain")
 

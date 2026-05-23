@@ -6,29 +6,18 @@ import {
   Upload,
   Activity,
   FileText,
-  CheckCircle2,
-  AlertTriangle,
   TrendingUp,
   Bot,
-  Sparkles,
   Search,
   Cpu,
   Layers,
   ShieldCheck,
-  Check,
   ChevronRight,
   Send,
-  HelpCircle,
-  BarChart as BarChartIcon,
   MessageSquare,
-  TrendingDown
 } from "lucide-react";
 import {
   ResponsiveContainer,
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
   Tooltip,
   Legend,
   RadarChart,
@@ -36,9 +25,6 @@ import {
   PolarAngleAxis,
   PolarRadiusAxis,
   Radar,
-  Cell,
-  LineChart,
-  Line
 } from "recharts";
 
 type Citation = {
@@ -73,7 +59,6 @@ export default function Home() {
 
   // Core application states
   const [activeReportId, setActiveReportId] = useState<string | null>(null);
-  const [reportsList, setReportsList] = useState<any[]>([]);
   const [activeReport, setActiveReport] = useState<any>(null);
   
   // Pipeline status tracking
@@ -92,10 +77,6 @@ export default function Home() {
   const [isChatLoading, setIsChatLoading] = useState<boolean>(false);
   const [chatSessionId, setChatSessionId] = useState<string | null>(null);
   
-  // Custom manual query trigger state
-  const [retriggerQuery, setRetriggerQuery] = useState<string>("");
-  const [isRetriggering, setIsRetriggering] = useState<boolean>(false);
-
   // Dedicated company comparison state
   const [compareInput, setCompareInput] = useState<string>("");
   const [compareStatus, setCompareStatus] = useState<"idle" | "loading" | "done">("idle");
@@ -123,12 +104,12 @@ export default function Home() {
   useEffect(() => {
     fetch("http://localhost:8000/api/reports")
       .then(r => { if (r.ok) { setBackendOnline(true); return r.json(); } throw new Error(); })
-      .then(list => setReportsList(list))
+      .then(() => undefined)
       .catch(() => { setBackendOnline(false); console.warn("Backend offline."); });
   }, []);
 
   // Fetch full details of a processed report and hydrate UI
-  const selectReport = useCallback(async (id: string, companyName: string) => {
+  const selectReport = useCallback(async (id: string) => {
     setActiveReportId(id);
     setProcessingStatus("complete");
     try {
@@ -160,7 +141,7 @@ export default function Home() {
     formData.append("file", new File([blob], `${company}_10K_2025.pdf`, { type: "application/pdf" }));
     formData.append("company_name", company);
     formData.append("user_query", "Analyze all risks and sentiment. Compare against key industry peers and generate competitive benchmarks.");
-    await runUploadAndPoll(formData, company);
+    await runUploadAndPoll(formData);
   };
 
   // Promise-based poll: resolves only when backend status = complete or failed
@@ -182,15 +163,8 @@ export default function Home() {
     });
   }, []);
 
-  const pollBackendStatus = useCallback(async (repId: string, companyName: string) => {
-    await pollUntilComplete(repId);
-    await selectReport(repId, companyName);
-  }, [pollUntilComplete, selectReport]);
-
-  const useSimulator = false;
-
   // Shared upload+poll handler used by templates and file upload
-  const runUploadAndPoll = async (formData: FormData, companyHint: string) => {
+  const runUploadAndPoll = async (formData: FormData) => {
     setProcessingStatus("processing");
     setPipelineLogs(["Uploading filing to Aegis backend..."]);
     setCurrentStep("Uploading...");
@@ -199,12 +173,10 @@ export default function Home() {
     try {
       const r = await fetch("http://localhost:8000/api/upload", { method: "POST", body: formData });
       if (!r.ok) { const e = await r.json(); throw new Error(e.detail || "Upload failed"); }
-      const { report_id, company_name } = await r.json();
+      const { report_id } = await r.json();
       setActiveReportId(report_id);
       await pollUntilComplete(report_id);
-      await selectReport(report_id, company_name || companyHint);
-      const listRes = await fetch("http://localhost:8000/api/reports");
-      if (listRes.ok) setReportsList(await listRes.json());
+      await selectReport(report_id);
     } catch (err: any) {
       setProcessingStatus("failed");
       setCurrentStep(`Error: ${err.message}`);
@@ -219,49 +191,7 @@ export default function Home() {
     const formData = new FormData();
     formData.append("file", file);
     formData.append("user_query", "Analyze all operational risks and sentiment. Compare against key industry competitors and generate comprehensive benchmarks.");
-    await runUploadAndPoll(formData, file.name.replace(/\.pdf$/i, ""));
-  };
-
-  // Triggers comparative re-analysis with custom prompt
-  const handleRetriggerAnalysis = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!retriggerQuery.trim() || !activeReportId) return;
-    
-    console.log("Re-triggering LangGraph with query:", retriggerQuery);
-    setIsRetriggering(true);
-    setProcessingStatus("processing");
-    setCurrentStep("Re-triggering pipeline...");
-    setPipelineLogs(prev => [...prev, `💡 Re-triggering pipeline with query: "${retriggerQuery}"`]);
-
-    if (useSimulator) {
-      setTimeout(() => {
-        setIsRetriggering(false);
-        setProcessingStatus("complete");
-        setRetriggerQuery("");
-      }, 2000);
-      return;
-    }
-
-    try {
-      const res = await fetch("http://localhost:8000/api/reports/trigger", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          report_id: activeReportId,
-          query: retriggerQuery
-        })
-      });
-      
-      if (res.ok) {
-        setRetriggerQuery("");
-        setIsRetriggering(false);
-        pollBackendStatus(activeReportId, activeReport?.company_name || "Target");
-      }
-    } catch (err) {
-      console.error("Error retriggering backend:", err);
-      setIsRetriggering(false);
-      setProcessingStatus("complete");
-    }
+    await runUploadAndPoll(formData);
   };
 
   // Handle chatbot RAG messages
@@ -356,26 +286,10 @@ export default function Home() {
       }
     }
 
-    // Otherwise, do standard keyword highlighting for premium UX readability
     const normalizedText = text;
-    // Map keywords to highlight classes
-    const highlightTerms = [
-      { regex: /\b(supply chain|tsmc|wafer|foundry|cowos|packaging|allocations)\b/gi, className: "highlight-supply text-amber-300" },
-      { regex: /\b(nvidia|amd|intel|competitor|rivalry|competition|pricing power)\b/gi, className: "highlight-competitor text-blue-300" },
-      { regex: /\b(export restrictions|export controls|china|regulatory|government|restrictions)\b/gi, className: "highlight-risk text-red-300" }
-    ];
-
-    // Simple word splitting rendering is tricky, so we'll do clean inline styles or rendering
-    // For a fully bulletproof rendering, split paragraphs and render beautifully
     return (
       <div className="whitespace-pre-line leading-relaxed text-slate-300 space-y-4">
         {normalizedText.split('\n\n').map((paragraph, pIdx) => {
-          highlightTerms.forEach(({ regex: _regex, className: _className }) => {
-            // Find and wrap keywords
-            // Basic string replacement for rendering is simplified:
-            // Since this is read-only, we can render with standard styling or HTML parsing safely
-          });
-
           return (
             <p key={pIdx} className="leading-7 font-light">
               {paragraph}
@@ -869,7 +783,7 @@ export default function Home() {
                         });
                         if (!res.ok) throw new Error("Trigger failed");
                         await pollUntilComplete(activeReportId);
-                        await selectReport(activeReportId, activeReport?.company_name ?? "");
+                        await selectReport(activeReportId);
                         setCompareStatus("done");
                       } catch (err) {
                         console.error("Compare error:", err);

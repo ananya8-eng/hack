@@ -122,34 +122,23 @@ class RAGChatbot:
         except Exception:
             return ""
 
-    def query_chatbot(self, user_question: str, company_name: str = None, report_id: str = None, session_id: str = None) -> dict:
-        """
-        Retrieves top relevant chunks from ChromaDB and uses Qwen
-        to answer with precise inline citations.
-        Includes Phase 2: Query Routing, Hybrid Search, and ReRanking.
-        """
+    def _prepare_chat(self, user_question: str, company_name: str = None, report_id: str = None, session_id: str = None) -> dict:
         logger.info(f"RAG Chatbot processing question: '{user_question}'...")
-        
-        # Contextualize query if there's history
+
         if session_id and report_id:
             search_query = conversation_store.contextualize_query(user_question, report_id, session_id)
         else:
             search_query = user_question
-            
-        # 1. Route query to determine search parameters
+
         route = query_router.classify_query(search_query)
         alpha = route["alpha"]
         n_results_initial = route["target_n_results"]
-        
-        # 2. Hybrid Retrieval (Semantic + Keyword)
+
         search_engine = HybridSearchEngine(chromadb_manager)
-        
-        # Retrieve broadly from report collection (if provided) and optionally fallback/global
-        # We query the report specifically to avoid cross-contamination unless it's comparative
         where_filter = None
         if company_name and route["query_type"] != "comparative":
             where_filter = {"company": company_name}
-            
+
         chunks = search_engine.search(
             query=search_query,
             report_id=report_id,
@@ -166,18 +155,15 @@ class RAGChatbot:
                 where=where_filter,
                 alpha=alpha
             )
-            
+
         logger.info(f"Hybrid retrieval fetched {len(chunks)} chunks.")
 
-        # 3. Cross-Encoder Re-Ranking
         if chunks:
             chunks = reranker.rerank(search_query, chunks, top_k=8)
-            # Apply MMR for diversity
             chunks = search_engine.filter_mmr(search_query, chunks, top_k=4, diversity=0.25)
-            
+
         logger.info(f"Reranking & MMR distilled to {len(chunks)} top chunks.")
 
-        # Formulate context block
         context_parts = []
         for i, item in enumerate(chunks):
             meta = item.get("metadata", {})
@@ -189,10 +175,9 @@ class RAGChatbot:
                 f"Source [{comp} {sec} - Chunk {chunk_idx}]:\n"
                 f"{item.get('document')}\n"
             )
-            
+
         context_text = "\n".join(context_parts)
 
-        # Build prompt with conversation history
         history_str = ""
         if session_id and report_id:
             history_str = conversation_store.format_history_for_prompt(report_id, session_id)
@@ -205,56 +190,55 @@ class RAGChatbot:
             conversation_history=history_str
         )
 
-        response_text = self._call_ollama(prompt)
-        
-        if response_text and len(response_text.strip()) > 50:
-            if session_id and report_id:
-                conversation_store.add_message(report_id, session_id, "assistant", response_text.strip())
-                
-            # Phase 4: Verify citations and check for hallucinations
-            verification = citation_verifier.verify_citations(response_text, chunks)
-            guard_result = hallucination_guard.check_faithfulness(response_text, chunks)
-            
-            # Fallback to heuristic citations if verification yielded none but we have chunks
-            verified_citations = verification["verified_citations"]
-            if not verified_citations and chunks:
-                for item in chunks:
-                    meta = item.get("metadata", {})
-                    sec = meta.get("section", "Section").replace("_", " ").title()
-                    comp = meta.get("company", "Company")
-                    chunk_idx = meta.get("chunk_index", 0)
-                    verified_citations.append({
-                        "citation_id": f"[{comp} {sec} - Chunk {chunk_idx}]",
-                        "section": sec,
-                        "company": comp,
-                        "chunk_index": chunk_idx,
-                        "content": item.get("document")[:300] + "..."
-                    })
-            
-            retrieval_stats = {
-                "chunks_retrieved_initial": n_results_initial,
-                "chunks_after_rerank": len(chunks),
-                "alpha_used": alpha
-            }
+        return {
+            "search_query": search_query,
+            "route": route,
+            "alpha": alpha,
+            "n_results_initial": n_results_initial,
+            "chunks": chunks,
+            "prompt": prompt
+        }
 
-            return format_rag_response(
-                answer=response_text.strip(),
-                verified_citations=verified_citations,
-                unverified_claims=verification["unverified_claims"],
-                guard_result=guard_result,
-                query_route=route,
-                retrieval_stats=retrieval_stats,
-                session_id=session_id
-            )
+    def _format_llm_response(self, response_text: str, chunks: list, route: dict, n_results_initial: int, alpha: float, session_id: str = None) -> dict:
+        verification = citation_verifier.verify_citations(response_text, chunks)
+        guard_result = hallucination_guard.check_faithfulness(response_text, chunks)
 
-        # ==========================================
-        # HEURISTIC RAG FALLBACK
-        # ==========================================
+        verified_citations = verification["verified_citations"]
+        if not verified_citations and chunks:
+            for item in chunks:
+                meta = item.get("metadata", {})
+                sec = meta.get("section", "Section").replace("_", " ").title()
+                comp = meta.get("company", "Company")
+                chunk_idx = meta.get("chunk_index", 0)
+                verified_citations.append({
+                    "citation_id": f"[{comp} {sec} - Chunk {chunk_idx}]",
+                    "section": sec,
+                    "company": comp,
+                    "chunk_index": chunk_idx,
+                    "content": item.get("document")[:300] + "..."
+                })
+
+        retrieval_stats = {
+            "chunks_retrieved_initial": n_results_initial,
+            "chunks_after_rerank": len(chunks),
+            "alpha_used": alpha,
+            "search_strategy": "hybrid",
+            "mmr_applied": bool(chunks)
+        }
+
+        return format_rag_response(
+            answer=response_text.strip(),
+            verified_citations=verified_citations,
+            unverified_claims=verification["unverified_claims"],
+            guard_result=guard_result,
+            query_route=route,
+            retrieval_stats=retrieval_stats,
+            session_id=session_id
+        )
+
+    def _format_fallback_response(self, search_query: str, chunks: list, route: dict, n_results_initial: int, alpha: float, session_id: str = None) -> dict:
         logger.info("Executing Heuristic RAG Q&A Engine...")
         fallback_res = generate_heuristic_rag_answer(search_query, chunks)
-        if session_id and report_id:
-            conversation_store.add_message(report_id, session_id, "assistant", fallback_res["answer"])
-
         fallback_guard = hallucination_guard.check_faithfulness(fallback_res["answer"], chunks)
         if not chunks:
             fallback_guard = {
@@ -281,6 +265,112 @@ class RAGChatbot:
             "success": True,
             "session_id": session_id
         }
+
+    def query_chatbot(self, user_question: str, company_name: str = None, report_id: str = None, session_id: str = None) -> dict:
+        """
+        Retrieves top relevant chunks from ChromaDB and uses Qwen
+        to answer with precise inline citations.
+        """
+        prepared = self._prepare_chat(user_question, company_name, report_id, session_id)
+        chunks = prepared["chunks"]
+        route = prepared["route"]
+        n_results_initial = prepared["n_results_initial"]
+        alpha = prepared["alpha"]
+
+        response_text = self._call_ollama(prepared["prompt"])
+        
+        if response_text and len(response_text.strip()) > 50:
+            if session_id and report_id:
+                conversation_store.add_message(report_id, session_id, "assistant", response_text.strip())
+            return self._format_llm_response(response_text, chunks, route, n_results_initial, alpha, session_id)
+
+        fallback_res = self._format_fallback_response(
+            prepared["search_query"],
+            chunks,
+            route,
+            n_results_initial,
+            alpha,
+            session_id
+        )
+        if session_id and report_id:
+            conversation_store.add_message(report_id, session_id, "assistant", fallback_res["answer"])
+        return fallback_res
+
+    def stream_chatbot(self, user_question: str, company_name: str = None, report_id: str = None, session_id: str = None):
+        """
+        Yields ("token", text) chunks from Ollama when available, followed by
+        ("metadata", dict). Falls back to the deterministic answer path if the
+        local model is offline.
+        """
+        prepared = self._prepare_chat(user_question, company_name, report_id, session_id)
+        chunks = prepared["chunks"]
+        route = prepared["route"]
+        n_results_initial = prepared["n_results_initial"]
+        alpha = prepared["alpha"]
+        answer_parts = []
+
+        try:
+            response = requests.post(
+                self.ollama_url,
+                json={
+                    "model": self.model_name,
+                    "prompt": prepared["prompt"],
+                    "stream": True,
+                    "options": {"temperature": 0.1}
+                },
+                stream=True,
+                timeout=12
+            )
+            if response.status_code != 200:
+                raise RuntimeError(f"Ollama returned {response.status_code}")
+
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                payload = json.loads(line)
+                token = payload.get("response", "")
+                if token:
+                    answer_parts.append(token)
+                    yield ("token", token)
+                if payload.get("done"):
+                    break
+        except Exception as e:
+            logger.info(f"Streaming Ollama unavailable; using heuristic fallback: {e}")
+            fallback_res = self._format_fallback_response(
+                prepared["search_query"],
+                chunks,
+                route,
+                n_results_initial,
+                alpha,
+                session_id
+            )
+            if session_id and report_id:
+                conversation_store.add_message(report_id, session_id, "assistant", fallback_res["answer"])
+            yield ("token", fallback_res["answer"])
+            meta = {k: v for k, v in fallback_res.items() if k != "answer"}
+            yield ("metadata", meta)
+            return
+
+        response_text = "".join(answer_parts).strip()
+        if not response_text:
+            fallback_res = self._format_fallback_response(
+                prepared["search_query"],
+                chunks,
+                route,
+                n_results_initial,
+                alpha,
+                session_id
+            )
+            yield ("token", fallback_res["answer"])
+            meta = {k: v for k, v in fallback_res.items() if k != "answer"}
+            yield ("metadata", meta)
+            return
+
+        if session_id and report_id:
+            conversation_store.add_message(report_id, session_id, "assistant", response_text)
+        final_res = self._format_llm_response(response_text, chunks, route, n_results_initial, alpha, session_id)
+        meta = {k: v for k, v in final_res.items() if k != "answer"}
+        yield ("metadata", meta)
 
 # Singleton helper
 rag_chatbot = RAGChatbot()
