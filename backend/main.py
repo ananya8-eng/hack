@@ -3,11 +3,13 @@ import uuid
 import logging
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Force instant-startup by default (can be overrode by system environment)
-os.environ.setdefault("USE_MOCK_EMBEDDINGS", "true")
+# Embedding mode: 'mock' for fast dev, 'real' for production
+# Set EMBEDDING_MODE=real to use BAAI/bge-large-en-v1.5
+os.environ.setdefault("EMBEDDING_MODE", "mock")
 
 # Import our custom components
 from backend.ingestion.pdf_extractor import extract_pdf_text
@@ -38,6 +40,7 @@ REPORTS_DB = {}
 class ChatRequest(BaseModel):
     report_id: str
     message: str
+    session_id: Optional[str] = None
 
 class TriggerRequest(BaseModel):
     report_id: str
@@ -76,8 +79,8 @@ def run_agent_pipeline_task(report_id: str, raw_text: str, company: str, query: 
     try:
         REPORTS_DB[report_id]["status"] = "processing"
         
-        # Run the full LangGraph pipeline
-        final_state = run_financial_pipeline(raw_text, company, query)
+        # Run the full LangGraph pipeline (pass report_id for scoped vector storage)
+        final_state = run_financial_pipeline(raw_text, company, query, report_id=report_id)
         
         # Extract fields from the LangGraph AgentState
         original_analysis = final_state.get("original_analysis", {})
@@ -255,6 +258,7 @@ async def trigger_analysis(req: TriggerRequest, background_tasks: BackgroundTask
 async def chatbot_query(req: ChatRequest):
     """
     Conversational RAG Chatbot query endpoint. Matches query against report embeddings.
+    Supports multi-turn conversation via session_id.
     """
     report_id = req.report_id
     if report_id not in REPORTS_DB:
@@ -262,10 +266,82 @@ async def chatbot_query(req: ChatRequest):
         
     report = REPORTS_DB[report_id]
     company = report["company_name"]
+    session_id = req.session_id or str(uuid.uuid4())
     
-    # Ask chatbot
-    chatbot_res = rag_chatbot.query_chatbot(req.message, company)
+    # Ask chatbot with session and report scoping
+    chatbot_res = rag_chatbot.query_chatbot(
+        user_question=req.message,
+        company_name=company,
+        report_id=report_id,
+        session_id=session_id,
+    )
+    chatbot_res["session_id"] = session_id
     return chatbot_res
+
+
+@app.post("/api/chat/stream")
+async def chatbot_query_stream(req: ChatRequest):
+    """
+    Streaming RAG Chatbot endpoint. Streams tokens as they are generated.
+    """
+    report_id = req.report_id
+    if report_id not in REPORTS_DB:
+        raise HTTPException(status_code=404, detail="Report not found.")
+
+    report = REPORTS_DB[report_id]
+    company = report["company_name"]
+    session_id = req.session_id or str(uuid.uuid4())
+
+    async def _stream():
+        result = rag_chatbot.query_chatbot(
+            user_question=req.message,
+            company_name=company,
+            report_id=report_id,
+            session_id=session_id,
+        )
+        import json
+        # Stream the answer in small chunks for frontend display
+        answer = result.get("answer", "")
+        chunk_size = 20
+        for i in range(0, len(answer), chunk_size):
+            yield answer[i:i+chunk_size]
+        # Final metadata packet
+        meta = {k: v for k, v in result.items() if k != "answer"}
+        meta["session_id"] = session_id
+        yield "\n__META__" + json.dumps(meta)
+
+    return StreamingResponse(_stream(), media_type="text/plain")
+
+
+@app.get("/api/chat/{report_id}/history")
+async def get_chat_history(report_id: str, session_id: str = None):
+    """
+    Returns conversation history for a report + session.
+    """
+    if report_id not in REPORTS_DB:
+        raise HTTPException(status_code=404, detail="Report not found.")
+
+    from backend.rag.conversation_memory import conversation_store
+    if session_id:
+        history = conversation_store.get_history(report_id, session_id)
+    else:
+        history = conversation_store.get_all_sessions(report_id)
+    return {"report_id": report_id, "session_id": session_id, "history": history}
+
+
+@app.get("/api/rag/diagnostics/{report_id}")
+async def rag_diagnostics(report_id: str):
+    """
+    Returns RAG diagnostics for a report: chunk count, embedding status, sample queries.
+    """
+    if report_id not in REPORTS_DB:
+        raise HTTPException(status_code=404, detail="Report not found.")
+
+    from backend.rag.rag_diagnostics import get_diagnostics
+    report = REPORTS_DB[report_id]
+    company = report["company_name"]
+    diagnostics = get_diagnostics(report_id, company)
+    return diagnostics
 
 if __name__ == "__main__":
     import uvicorn

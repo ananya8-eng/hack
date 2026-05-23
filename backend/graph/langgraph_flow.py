@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Define our robust LangGraph State
 class AgentState(TypedDict):
+    report_id: str
     company_name: str
     raw_text: str
     user_query: str
@@ -54,6 +55,7 @@ def node_ingest_and_chunk(state: AgentState) -> Dict[str, Any]:
     
     raw_text = state.get("raw_text", "")
     company = state.get("company_name", "Target Company")
+    report_id = state.get("report_id", "")
     
     # Extract Narrative Sections
     sections = extract_sections(raw_text)
@@ -66,8 +68,17 @@ def node_ingest_and_chunk(state: AgentState) -> Dict[str, Any]:
             continue
         chunks = split_text_into_chunks(text)
         if chunks:
-            ids = [f"{company}_{section_name}_{uuid.uuid4().hex[:6]}_{i}" for i in range(len(chunks))]
-            metadata = [{"company": company, "section": section_name, "chunk_index": i} for i in range(len(chunks))]
+            ids = [f"{report_id}_{company}_{section_name}_{uuid.uuid4().hex[:6]}_{i}" for i in range(len(chunks))]
+            metadata = [
+                {
+                    "report_id": report_id,
+                    "company": company,
+                    "section": section_name,
+                    "chunk_index": i,
+                    "filing_type": "uploaded_filing"
+                }
+                for i in range(len(chunks))
+            ]
             chromadb_manager.add_chunks(chunks, metadata, ids)
             total_indexed += len(chunks)
             
@@ -143,6 +154,7 @@ def node_validation(state: AgentState) -> Dict[str, Any]:
     scraped_docs = state.get("scraped_documents", [])
     company = state.get("company_name", "Target Company")
     targets = state.get("targets", [])
+    report_id = state.get("report_id", "")
     
     logs.append("Step 4: Spawning Validator Agent to audit external scraped content...")
     logger.info("LangGraph Node: Validation starting.")
@@ -167,8 +179,17 @@ def node_validation(state: AgentState) -> Dict[str, Any]:
             # Smart bonus: Index competitor chunks in ChromaDB too! This allows comparative chat citations!
             comp_chunks = split_text_into_chunks(audit_res.get("cleaned_content", ""))
             if comp_chunks:
-                ids = [f"{doc.get('company')}_competitor_{uuid.uuid4().hex[:6]}_{i}" for i in range(len(comp_chunks))]
-                metadata = [{"company": doc.get("company"), "section": "competitor_analysis", "chunk_index": i} for i in range(len(comp_chunks))]
+                ids = [f"{report_id}_{doc.get('company')}_competitor_{uuid.uuid4().hex[:6]}_{i}" for i in range(len(comp_chunks))]
+                metadata = [
+                    {
+                        "report_id": report_id,
+                        "company": doc.get("company"),
+                        "section": "competitor_analysis",
+                        "chunk_index": i,
+                        "filing_type": doc.get("filing_type", "10-K")
+                    }
+                    for i in range(len(comp_chunks))
+                ]
                 chromadb_manager.add_chunks(comp_chunks, metadata, ids)
         else:
             logs.append(f"❌ REJECTED: Content from '{doc.get('company')}' failed audit. Reason: {audit_res.get('rejection_reason')}")
@@ -254,11 +275,12 @@ def build_financial_intelligence_graph() -> StateGraph:
 # Instantiated graph runner helper
 financial_graph = build_financial_intelligence_graph()
 
-def run_financial_pipeline(raw_pdf_text: str, company: str, query: str = "") -> dict:
+def run_financial_pipeline(raw_pdf_text: str, company: str, query: str = "", report_id: str = "") -> dict:
     """
     Synchronous helper to run the compiled LangGraph and return the complete State.
     """
     initial_state = {
+        "report_id": report_id or uuid.uuid4().hex,
         "company_name": company,
         "raw_text": raw_pdf_text,
         "user_query": query,

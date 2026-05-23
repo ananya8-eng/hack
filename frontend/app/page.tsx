@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
@@ -40,6 +41,33 @@ import {
   Line
 } from "recharts";
 
+type Citation = {
+  citation_id?: string;
+  company?: string;
+  chunk_index?: number;
+  content?: string;
+};
+
+type Risk = {
+  category?: string;
+  risk_name?: string;
+  severity?: string;
+  evidence?: string;
+  implication?: string;
+};
+
+type Benchmark = {
+  metric_name?: string;
+  target_company?: string;
+  comparison_value?: string;
+};
+
+type ToneShift = {
+  comparison_target?: string;
+  shift_direction?: string;
+  details?: string;
+};
+
 
 export default function Home() {
 
@@ -62,6 +90,7 @@ export default function Home() {
   const [chatMessages, setChatMessages] = useState<any[]>([]);
   const [chatInput, setChatInput] = useState<string>("");
   const [isChatLoading, setIsChatLoading] = useState<boolean>(false);
+  const [chatSessionId, setChatSessionId] = useState<string | null>(null);
   
   // Custom manual query trigger state
   const [retriggerQuery, setRetriggerQuery] = useState<string>("");
@@ -114,6 +143,7 @@ export default function Home() {
           content: `Analysis of ${fullReport.company_name}'s filing is complete. Ask me about risks, margins, sentiment, or competitor comparisons.`,
           citations: []
         }]);
+        setChatSessionId(null);
       }
     } catch (err) {
       console.error("Error loading report:", err);
@@ -151,6 +181,13 @@ export default function Home() {
       setTimeout(() => { clearInterval(iv); resolve(); }, 300_000);
     });
   }, []);
+
+  const pollBackendStatus = useCallback(async (repId: string, companyName: string) => {
+    await pollUntilComplete(repId);
+    await selectReport(repId, companyName);
+  }, [pollUntilComplete, selectReport]);
+
+  const useSimulator = false;
 
   // Shared upload+poll handler used by templates and file upload
   const runUploadAndPoll = async (formData: FormData, companyHint: string) => {
@@ -245,12 +282,14 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           report_id: activeReportId,
-          message: userMsg
+          message: userMsg,
+          session_id: chatSessionId
         })
       });
       
       if (res.ok) {
         const data = await res.json();
+        if (data.session_id) setChatSessionId(data.session_id);
         setChatMessages(prev => [...prev, {
           id: newId + 1,
           role: "assistant",
@@ -331,9 +370,7 @@ export default function Home() {
     return (
       <div className="whitespace-pre-line leading-relaxed text-slate-300 space-y-4">
         {normalizedText.split('\n\n').map((paragraph, pIdx) => {
-          let renderedNode: React.ReactNode = paragraph;
-          
-          highlightTerms.forEach(({ regex, className }) => {
+          highlightTerms.forEach(({ regex: _regex, className: _className }) => {
             // Find and wrap keywords
             // Basic string replacement for rendering is simplified:
             // Since this is read-only, we can render with standard styling or HTML parsing safely
@@ -526,10 +563,10 @@ export default function Home() {
                         <div className="mt-2.5 pt-2.5 border-t border-indigo-900/40 space-y-1">
                           <span className="text-[9px] text-indigo-400 font-semibold block uppercase">Retrieved Citations:</span>
                           <div className="flex flex-wrap gap-1">
-                            {msg.citations.map((cit, cIdx) => (
+                            {msg.citations.map((cit: Citation, cIdx: number) => (
                               <button
                                 key={cIdx}
-                                onClick={() => handleRiskCardClick(cit.content, `highlight-${cit.company}-${cit.chunk_index}`)}
+                                onClick={() => handleRiskCardClick(cit.content || "", `highlight-${cit.company}-${cit.chunk_index}`)}
                                 className="text-[10px] px-2 py-0.5 rounded bg-indigo-900/60 hover:bg-indigo-800/80 border border-indigo-500/20 text-indigo-300 font-mono transition flex items-center gap-1 active:scale-95"
                               >
                                 <Search className="w-2.5 h-2.5" />
@@ -724,14 +761,14 @@ export default function Home() {
                   <p className="text-xs text-slate-400">Risk profiles will compile once a filing report is loaded.</p>
                 </div>
               ) : (
-                (activeReport.result?.risks ?? []).map((risk, index) => {
+                (activeReport.result?.risks ?? []).map((risk: Risk, index: number) => {
                   const highlightId = `highlight-${activeReport.company_name}-${index}`;
                   const isActive = activeHighlightId === highlightId;
                   
                   return (
                     <div
                       key={index}
-                      onClick={() => handleRiskCardClick(risk.evidence, highlightId)}
+                      onClick={() => handleRiskCardClick(risk.evidence || "", highlightId)}
                       className={`p-3 rounded-lg border text-xs cursor-pointer transition flex flex-col gap-2 relative overflow-hidden ${
                         isActive
                           ? "bg-indigo-900/30 border-indigo-500 shadow-md shadow-indigo-500/10"
@@ -755,7 +792,7 @@ export default function Home() {
                           risk.severity === "Medium" ? "bg-amber-950 text-amber-300 border border-amber-500/20" :
                           "bg-slate-900 text-slate-300 border border-slate-700/50"
                         }`}>
-                          {risk.severity.toUpperCase()}
+                          {(risk.severity || "Medium").toUpperCase()}
                         </span>
                       </div>
 
@@ -893,7 +930,7 @@ export default function Home() {
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-indigo-950/30 text-slate-300">
-                          {activeReport.result.final_comparative_analysis.competitor_benchmarks.map((bm: any, bIdx: number) => (
+                          {activeReport.result.final_comparative_analysis.competitor_benchmarks.map((bm: Benchmark, bIdx: number) => (
                             <tr key={bIdx} className="hover:bg-indigo-950/20">
                               <td className="py-1.5 pr-2 font-semibold text-[9px]">{bm.metric_name}</td>
                               <td className="py-1.5 text-center text-indigo-300 text-[9px]">{bm.target_company}</td>
@@ -909,7 +946,7 @@ export default function Home() {
                   {(activeReport.result?.final_comparative_analysis?.tone_shifts ?? []).length > 0 && (
                     <div className="bg-slate-950/40 rounded-lg border border-slate-900/50 p-2 space-y-1.5">
                       <span className="text-[9px] text-purple-400 font-semibold uppercase block tracking-wider">Management Tone Shifts</span>
-                      {activeReport.result.final_comparative_analysis.tone_shifts.map((ts: any, tIdx: number) => (
+                      {activeReport.result.final_comparative_analysis.tone_shifts.map((ts: ToneShift, tIdx: number) => (
                         <div key={tIdx} className="border-l-2 border-purple-500 pl-2 py-0.5 leading-snug">
                           <strong className="text-white text-[9px]">{ts.comparison_target} — {ts.shift_direction}:</strong>{" "}
                           <span className="text-slate-400 text-[9px]">{ts.details}</span>

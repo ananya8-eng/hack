@@ -3,6 +3,14 @@ import json
 import logging
 import requests
 from backend.tools.chroma_tool import chromadb_manager
+from backend.rag.hybrid_search import HybridSearchEngine
+from backend.rag.reranker import reranker
+from backend.rag.query_router import query_router
+from backend.rag.conversation_memory import conversation_store
+from backend.rag.prompt_templates import build_prompt
+from backend.rag.citation_verifier import citation_verifier
+from backend.rag.hallucination_guard import hallucination_guard
+from backend.rag.answer_formatter import format_rag_response
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +86,7 @@ def generate_heuristic_rag_answer(query: str, chunks: list) -> dict:
         # Compile up to 3 evidence points
         added_points = 0
         for sent, cit in evidence_sentences[:3]:
-            answer_parts.append(f"• {sent} {cit}")
+            answer_parts.append(f"- {sent} {cit}")
             added_points += 1
             
         answer = " ".join(answer_parts)
@@ -114,26 +122,60 @@ class RAGChatbot:
         except Exception:
             return ""
 
-    def query_chatbot(self, user_question: str, company_name: str = None) -> dict:
+    def query_chatbot(self, user_question: str, company_name: str = None, report_id: str = None, session_id: str = None) -> dict:
         """
-        Retrieves top relevant chunks from ChromaDB and uses Qwen (or Heuristic RAG)
-        to answer with precise inline citations, avoiding hallucinations.
+        Retrieves top relevant chunks from ChromaDB and uses Qwen
+        to answer with precise inline citations.
+        Includes Phase 2: Query Routing, Hybrid Search, and ReRanking.
         """
         logger.info(f"RAG Chatbot processing question: '{user_question}'...")
         
-        # Determine query filter
-        where_filter = None
-        if company_name:
-            where_filter = {"company": company_name}
-
-        # Query top 4 chunks
-        chunks = chromadb_manager.query_similar_chunks(user_question, n_results=4, where=where_filter)
-        
-        if not chunks:
-            # Try a broader search across all companies
-            chunks = chromadb_manager.query_similar_chunks(user_question, n_results=4)
+        # Contextualize query if there's history
+        if session_id and report_id:
+            search_query = conversation_store.contextualize_query(user_question, report_id, session_id)
+        else:
+            search_query = user_question
             
-        logger.info(f"Retrieved {len(chunks)} relevant chunks from ChromaDB.")
+        # 1. Route query to determine search parameters
+        route = query_router.classify_query(search_query)
+        alpha = route["alpha"]
+        n_results_initial = route["target_n_results"]
+        
+        # 2. Hybrid Retrieval (Semantic + Keyword)
+        search_engine = HybridSearchEngine(chromadb_manager)
+        
+        # Retrieve broadly from report collection (if provided) and optionally fallback/global
+        # We query the report specifically to avoid cross-contamination unless it's comparative
+        where_filter = None
+        if company_name and route["query_type"] != "comparative":
+            where_filter = {"company": company_name}
+            
+        chunks = search_engine.search(
+            query=search_query,
+            report_id=report_id,
+            n_results=n_results_initial,
+            where=where_filter,
+            alpha=alpha
+        )
+        
+        if not chunks and not report_id and route["query_type"] != "comparative":
+            # Broaden search to global only when the caller did not request a report scope.
+            chunks = search_engine.search(
+                query=search_query,
+                n_results=n_results_initial,
+                where=where_filter,
+                alpha=alpha
+            )
+            
+        logger.info(f"Hybrid retrieval fetched {len(chunks)} chunks.")
+
+        # 3. Cross-Encoder Re-Ranking
+        if chunks:
+            chunks = reranker.rerank(search_query, chunks, top_k=8)
+            # Apply MMR for diversity
+            chunks = search_engine.filter_mmr(search_query, chunks, top_k=4, diversity=0.25)
+            
+        logger.info(f"Reranking & MMR distilled to {len(chunks)} top chunks.")
 
         # Formulate context block
         context_parts = []
@@ -150,55 +192,95 @@ class RAGChatbot:
             
         context_text = "\n".join(context_parts)
 
-        prompt = f"""
-        [System] You are an elite, citation-backed Financial RAG Chatbot. 
-        Your primary directive is to answer the user's question STRICTLY using the provided filing contexts.
-        
-        [Rules]
-        1. Answer ONLY using the facts from the context. Do NOT hallucinate.
-        2. Provide precise inline citations citing the sources in brackets, e.g., [NVIDIA Risk Factors - Chunk 4].
-        3. If the context does not contain enough information to answer, state clearly: "I cannot find sufficient evidence in the retrieved filings to answer this." Do not make up facts.
-        
-        [Retrieved Filing Contexts]
-        {context_text}
-        
-        [User Question]
-        {user_question}
-        
-        [Task]
-        Synthesize your comprehensive response with citations.
-        """
+        # Build prompt with conversation history
+        history_str = ""
+        if session_id and report_id:
+            history_str = conversation_store.format_history_for_prompt(report_id, session_id)
+            conversation_store.add_message(report_id, session_id, "user", user_question)
+
+        prompt = build_prompt(
+            query_type=route["query_type"],
+            context_text=context_text,
+            user_question=user_question,
+            conversation_history=history_str
+        )
 
         response_text = self._call_ollama(prompt)
         
         if response_text and len(response_text.strip()) > 50:
-            # Build citations list for UI display
-            citations = []
-            for item in chunks:
-                meta = item.get("metadata", {})
-                sec = meta.get("section", "Section").replace("_", " ").title()
-                comp = meta.get("company", "Company")
-                chunk_idx = meta.get("chunk_index", 0)
+            if session_id and report_id:
+                conversation_store.add_message(report_id, session_id, "assistant", response_text.strip())
                 
-                citations.append({
-                    "citation_id": f"[{comp} {sec} - Chunk {chunk_idx}]",
-                    "section": sec,
-                    "company": comp,
-                    "chunk_index": chunk_idx,
-                    "content": item.get("document")[:300] + "..."
-                })
+            # Phase 4: Verify citations and check for hallucinations
+            verification = citation_verifier.verify_citations(response_text, chunks)
+            guard_result = hallucination_guard.check_faithfulness(response_text, chunks)
             
-            return {
-                "answer": response_text.strip(),
-                "citations": citations,
-                "success": True
+            # Fallback to heuristic citations if verification yielded none but we have chunks
+            verified_citations = verification["verified_citations"]
+            if not verified_citations and chunks:
+                for item in chunks:
+                    meta = item.get("metadata", {})
+                    sec = meta.get("section", "Section").replace("_", " ").title()
+                    comp = meta.get("company", "Company")
+                    chunk_idx = meta.get("chunk_index", 0)
+                    verified_citations.append({
+                        "citation_id": f"[{comp} {sec} - Chunk {chunk_idx}]",
+                        "section": sec,
+                        "company": comp,
+                        "chunk_index": chunk_idx,
+                        "content": item.get("document")[:300] + "..."
+                    })
+            
+            retrieval_stats = {
+                "chunks_retrieved_initial": n_results_initial,
+                "chunks_after_rerank": len(chunks),
+                "alpha_used": alpha
             }
+
+            return format_rag_response(
+                answer=response_text.strip(),
+                verified_citations=verified_citations,
+                unverified_claims=verification["unverified_claims"],
+                guard_result=guard_result,
+                query_route=route,
+                retrieval_stats=retrieval_stats,
+                session_id=session_id
+            )
 
         # ==========================================
         # HEURISTIC RAG FALLBACK
         # ==========================================
         logger.info("Executing Heuristic RAG Q&A Engine...")
-        return generate_heuristic_rag_answer(user_question, chunks)
+        fallback_res = generate_heuristic_rag_answer(search_query, chunks)
+        if session_id and report_id:
+            conversation_store.add_message(report_id, session_id, "assistant", fallback_res["answer"])
+
+        fallback_guard = hallucination_guard.check_faithfulness(fallback_res["answer"], chunks)
+        if not chunks:
+            fallback_guard = {
+                "confidence": 0.0,
+                "is_safe": True,
+                "flags": ["No retrieved chunks available"]
+            }
+
+        return {
+            "answer": fallback_res["answer"],
+            "citations": fallback_res.get("citations", []),
+            "confidence_score": fallback_guard.get("confidence", 0.0),
+            "is_safe": fallback_guard.get("is_safe", True),
+            "flags": fallback_guard.get("flags", []),
+            "unverified_claims": [],
+            "query_type": route.get("query_type"),
+            "retrieval_metadata": {
+                "chunks_retrieved_initial": n_results_initial,
+                "chunks_after_rerank": len(chunks),
+                "alpha_used": alpha,
+                "search_strategy": "hybrid",
+                "mmr_applied": bool(chunks)
+            },
+            "success": True,
+            "session_id": session_id
+        }
 
 # Singleton helper
 rag_chatbot = RAGChatbot()
