@@ -184,7 +184,13 @@ class FinancialScraper:
     def fetch_sec_filing(self, company: str, filing_type: str = "10-K") -> dict:
         """Fetch a filing from SEC EDGAR for any resolvable company/ticker."""
         ticker = self.resolve_ticker(company)
+        
+        # Check if filing_type ends with -PRIOR
+        is_prior = filing_type.upper().endswith("-PRIOR")
+        actual_type = filing_type[:-6] if is_prior else filing_type
+        actual_upper = actual_type.upper().strip() or "10-K"
         filing_upper = filing_type.upper().strip() or "10-K"
+
         logger.info("Fetching %s filing for: %s (%s)", filing_upper, company, ticker)
 
         try:
@@ -195,37 +201,45 @@ class FinancialScraper:
                 self._sec_email,
                 self.download_dir,
             )
-            count = dl.get(filing_upper, ticker, limit=1)
+            count = dl.get(actual_type, ticker, limit=2)
             if count > 0:
                 base = os.path.join(
-                    self.download_dir, "sec-edgar-filings", ticker, filing_upper
+                    self.download_dir, "sec-edgar-filings", ticker, actual_upper
                 )
                 if os.path.isdir(base):
-                    for root, _, files in os.walk(base):
-                        for fname in files:
-                            if fname.endswith((".txt", ".html")):
-                                path = os.path.join(root, fname)
-                                with open(
-                                    path, "r", encoding="utf-8", errors="ignore"
-                                ) as fh:
-                                    raw = fh.read()
-                                if fname.endswith(".html"):
-                                    text = BeautifulSoup(raw, "html.parser").get_text()
-                                else:
-                                    text = raw
-                                text = " ".join(text.split())[:12000]
-                                logger.info(
-                                    "SEC Edgar filing retrieved for %s (%s chars)",
-                                    ticker,
-                                    len(text),
-                                )
-                                return {
-                                    "success": True,
-                                    "source": f"SEC EDGAR Live ({ticker} {filing_upper})",
-                                    "text": text,
-                                    "company": ticker,
-                                    "filing_type": filing_upper,
-                                }
+                    subdirs = [
+                        os.path.join(base, d)
+                        for d in os.listdir(base)
+                        if os.path.isdir(os.path.join(base, d))
+                    ]
+                    if subdirs:
+                        subdirs.sort()
+                        selected_dir = subdirs[0] if is_prior else subdirs[-1]
+                        for root, _, files in os.walk(selected_dir):
+                            for fname in files:
+                                if fname.endswith((".txt", ".html")):
+                                    path = os.path.join(root, fname)
+                                    with open(
+                                        path, "r", encoding="utf-8", errors="ignore"
+                                    ) as fh:
+                                        raw = fh.read()
+                                    if fname.endswith(".html"):
+                                        text = BeautifulSoup(raw, "html.parser").get_text()
+                                    else:
+                                        text = raw
+                                    text = " ".join(text.split())[:50000 if is_prior else 12000]
+                                    logger.info(
+                                        "SEC Edgar filing retrieved for %s (%s chars)",
+                                        ticker,
+                                        len(text),
+                                    )
+                                    return {
+                                        "success": True,
+                                        "source": f"SEC EDGAR Live ({ticker} {filing_upper})",
+                                        "text": text,
+                                        "company": ticker,
+                                        "filing_type": filing_upper,
+                                    }
         except Exception as e:
             logger.warning("SEC Edgar download failed for %s: %s", ticker, e)
             return {
@@ -261,7 +275,7 @@ class FinancialScraper:
             return self.web_search(query, company=company)
 
         if req_type == "prior_filing":
-            res = self.fetch_sec_filing(company, filing_type)
+            res = self.fetch_sec_filing(company, f"{filing_type}-PRIOR")
             if res.get("success"):
                 res = {
                     **res,

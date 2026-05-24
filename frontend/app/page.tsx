@@ -102,14 +102,27 @@ export default function Home() {
 
   const getSectionCatalog = (report: any) => {
     const cat = report?.result?.section_catalog;
-    if (Array.isArray(cat) && cat.length > 0) return cat;
-    const secs = report?.result?.sections || {};
-    return Object.keys(secs).map((id: string) => ({
-      id,
-      title: id.replace(/_/g, " "),
-      priority: 50,
-      char_count: (secs[id] || "").length,
-    }));
+    let result: any[] = [];
+    if (Array.isArray(cat) && cat.length > 0) {
+      result = cat;
+    } else {
+      const secs = report?.result?.sections || {};
+      result = Object.keys(secs).map((id: string) => ({
+        id,
+        title: id.replace(/_/g, " "),
+        priority: 50,
+        char_count: (secs[id] || "").length,
+      }));
+    }
+    const seenTitles = new Set<string>();
+    return result.filter(item => {
+      const titleKey = (item.title || "").trim().toLowerCase();
+      if (seenTitles.has(titleKey)) {
+        return false;
+      }
+      seenTitles.add(titleKey);
+      return true;
+    });
   };
 
   const defaultSectionId = (catalog: { id: string; title: string }[]) => {
@@ -396,64 +409,489 @@ export default function Home() {
   // Helper to render narrative text with highlighted risk terms or active evidence
   const renderHighlightedText = (text: string, tab: string) => {
     if (!text) return <p className="text-slate-500 italic">No text extracted for this section.</p>;
-    
-    // If there's active evidence click, wrap that exact match in a neon-violet active bubble
-    if (activeEvidenceText && tab === activeFilingTab) {
-      const cleanEvidence = activeEvidenceText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); // Escape regex chars
-      try {
-        const regex = new RegExp(`(${cleanEvidence})`, "i");
-        const parts = text.split(regex);
-        if (parts.length > 1) {
-          return (
-            <div className="whitespace-pre-line leading-relaxed text-slate-300">
-              {parts.map((part, index) => {
-                if (regex.test(part)) {
-                  return (
-                    <span 
-                      key={index} 
-                      id={activeHighlightId || "evidence-highlighter"} 
-                      className="highlight-risk highlight-active rounded px-1 text-white font-medium"
-                    >
-                      {part}
-                    </span>
-                  );
-                }
-                return part;
-              })}
-            </div>
-          );
+
+    const renderTextWithHighlight = (txt: string) => {
+      if (activeEvidenceText && tab === activeFilingTab) {
+        const cleanEvidence = activeEvidenceText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        try {
+          const regex = new RegExp(`(${cleanEvidence})`, "i");
+          const parts = txt.split(regex);
+          if (parts.length > 1) {
+            return parts.map((part, index) => {
+              if (regex.test(part)) {
+                return (
+                  <span
+                    key={index}
+                    id={activeHighlightId || "evidence-highlighter"}
+                    className="highlight-risk highlight-active rounded px-1 text-white font-medium"
+                  >
+                    {part}
+                  </span>
+                );
+              }
+              return part;
+            });
+          }
+        } catch (e) {
+          console.error("Highlighter regex failed:", e);
         }
-      } catch (e) {
-        console.error("Highlighter regex failed:", e);
+      }
+      return txt;
+    };
+
+    // Step 2 — Identify financial token lines
+    const isFinancialToken = (line: string): boolean => {
+      const trimmed = line.trim();
+      if (trimmed === "$") return true;
+      if (trimmed.toLowerCase() === "change") return true;
+      if (/^\(?[0-9]{1,3}(,[0-9]{3})*\)?$/.test(trimmed)) return true;
+      if (/^\(?[0-9]+\)?$/.test(trimmed)) return true;
+      if (/^\(?[0-9]+(\.[0-9]+)?\s*%\)?$/.test(trimmed)) return true;
+      if (/^\(?[0-9]+(\.[0-9]+)?%\)?$/.test(trimmed)) return true;
+      if (/^(19|20)[0-9]{2}$/.test(trimmed)) return true;
+
+      const monthsPattern = /^(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/i;
+      const parts = trimmed.replace(/,/g, '').split(/\s+/);
+      if (parts.length === 2) {
+        if (monthsPattern.test(parts[0]) && /^[0-9]{1,2}$/.test(parts[1])) return true;
+      }
+      return false;
+    };
+
+    const isTitleCase = (str: string): boolean => {
+      const words = str.trim().split(/\s+/).filter(w => w.length > 0);
+      if (words.length === 0) return false;
+      const ignoreList = ["and", "or", "the", "of", "in", "for", "to", "with", "on", "at", "by", "an", "a", "from"];
+      let capCount = 0;
+      let letterWords = 0;
+      for (const word of words) {
+        const cleanWord = word.replace(/[^a-zA-Z]/g, "");
+        if (cleanWord.length === 0) continue;
+        letterWords++;
+        if (ignoreList.includes(word.toLowerCase())) {
+          capCount++;
+          continue;
+        }
+        if (cleanWord[0] === cleanWord[0].toUpperCase()) {
+          capCount++;
+        }
+      }
+      return letterWords > 0 && capCount === letterWords;
+    };
+
+    // Step 1 — Noise patterns cleanup & clean lines
+    const collapsed = text.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+    const rawLines = collapsed.split("\n").map(l => l.trim().replace(/(\d+(?:[.,]\d+)*)\?/g, "$1"));
+
+    const cleanLines = rawLines.filter(line => {
+      if (!line) return true; // keep blank line separators initially
+
+      // Noise patterns:
+      if (/^aapl-[0-9]+$/i.test(line)) return false;
+      if (/^\(\d+\)$/.test(line)) return false; // footnote markers like (1)
+      if (/^[—–-]+$/.test(line)) return false; // alone em-dash/en-dash
+      
+      // Document metadata/page info:
+      if (/^https?:\/\//i.test(line)) return false;
+      if (/^---\s*PAGE\s*\d+\s*---$/i.test(line)) return false;
+      if (/^\d+\/\d+$/.test(line)) return false;
+      if (/^\d{1,2}\/\d{1,2}\/\d{2,4},\s*\d{1,2}:\d{2}\s*(AM|PM)$/i.test(line)) return false;
+      if (/^[®\s]+$/.test(line)) return false;
+      if (line.includes('|') && (line.includes('10-Q') || line.includes('10-K') || line.includes('8-K'))) return false;
+      if (/^\d+$/.test(line) && line.length <= 3) return false;
+
+      return true;
+    });
+
+    // Collapse duplicate consecutive blank lines
+    const rawCleanLines: string[] = [];
+    let prevEmpty = false;
+    for (const line of cleanLines) {
+      const isEmpty = line === "";
+      if (isEmpty) {
+        if (!prevEmpty) {
+          rawCleanLines.push("");
+          prevEmpty = true;
+        }
+      } else {
+        rawCleanLines.push(line);
+        prevEmpty = false;
       }
     }
 
-    // Otherwise, do standard keyword highlighting for premium UX readability
-    const normalizedText = text;
-    // Map keywords to highlight classes
-    const highlightTerms = [
-      { regex: /\b(supply chain|tsmc|wafer|foundry|cowos|packaging|allocations)\b/gi, className: "highlight-supply text-amber-300" },
-      { regex: /\b(nvidia|amd|intel|competitor|rivalry|competition|pricing power)\b/gi, className: "highlight-competitor text-blue-300" },
-      { regex: /\b(export restrictions|export controls|china|regulatory|government|restrictions)\b/gi, className: "highlight-risk text-red-300" }
-    ];
+    const dateRangeRegex = /\b(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b\s+\d{1,2},\s+\d{4}\s+to\s+\b(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b\s+\d{1,2},\s+\d{4}:?/i;
 
-    // Simple word splitting rendering is tricky, so we'll do clean inline styles or rendering
-    // For a fully bulletproof rendering, split paragraphs and render beautifully
-    return (
-      <div className="whitespace-pre-line leading-relaxed text-slate-300 space-y-4">
-        {normalizedText.split('\n\n').map((paragraph, pIdx) => {
-          let renderedNode: React.ReactNode = paragraph;
+    // Fragmented PDF table column headers & date range row dividers pre-processing
+    const preProcessedLines: string[] = [];
+    let lIdx = 0;
+    while (lIdx < rawCleanLines.length) {
+      const line = rawCleanLines[lIdx];
+      
+      // Labelled financial row check
+      const trimmedLower = line.trim().toLowerCase();
+      const labelSet = new Set(["services", "products", "iphone", "mac", "ipad", "americas", "europe", "japan"]);
+      if (labelSet.has(trimmedLower)) {
+        lIdx++;
+        let valuesStr = "";
+        while (lIdx < rawCleanLines.length && isFinancialToken(rawCleanLines[lIdx])) {
+          valuesStr += "   " + rawCleanLines[lIdx];
+          lIdx++;
+        }
+        if (valuesStr) {
+          valuesStr = valuesStr.replace(/\$\s+/g, "$");
+          preProcessedLines.push(`[LabelledRow]:${line}    ${valuesStr.trim()}`);
+        } else {
+          preProcessedLines.push(line);
+        }
+        continue;
+      }
+
+      // Date range pattern row divider check
+      if (dateRangeRegex.test(line)) {
+        preProcessedLines.push(`[RowDivider]:${line}`);
+        lIdx++;
+        
+        // Indent the values on the next lines
+        if (lIdx < rawCleanLines.length) {
+          let valuesStr = "";
+          while (lIdx < rawCleanLines.length && isFinancialToken(rawCleanLines[lIdx])) {
+            valuesStr += "   " + rawCleanLines[lIdx];
+            lIdx++;
+          }
+          if (valuesStr) {
+            valuesStr = valuesStr.replace(/\$\s+/g, "$");
+            preProcessedLines.push(`[RowDividerValues]:${valuesStr.trim()}`);
+          }
+        }
+        continue;
+      }
+
+      // Column header fragments check
+      let count = 0;
+      while (
+        lIdx + count < rawCleanLines.length &&
+        rawCleanLines[lIdx + count].trim().length > 0 &&
+        rawCleanLines[lIdx + count].length < 25 &&
+        !rawCleanLines[lIdx + count].includes('$') &&
+        !rawCleanLines[lIdx + count].includes('%') &&
+        !/\d/.test(rawCleanLines[lIdx + count]) &&
+        !dateRangeRegex.test(rawCleanLines[lIdx + count])
+      ) {
+        count++;
+      }
+
+      if (count >= 3) {
+        const groupLines = rawCleanLines.slice(lIdx, lIdx + count);
+        const joinedText = groupLines.join(" ");
+        preProcessedLines.push(`[MutedHeader]:${joinedText}`);
+        lIdx += count;
+      } else {
+        preProcessedLines.push(rawCleanLines[lIdx]);
+        lIdx++;
+      }
+    }
+
+    // Fix duplicate rendering issue — remove consecutive duplicate lines
+    const uniqueCleanLines: string[] = [];
+    for (const line of preProcessedLines) {
+      if (uniqueCleanLines.length === 0 || line !== uniqueCleanLines[uniqueCleanLines.length - 1]) {
+        uniqueCleanLines.push(line);
+      }
+    }
+
+    const finalCleanLines = uniqueCleanLines;
+
+
+
+    // Linear O(N) search to find all maximal qualifying table blocks
+    interface TableRange {
+      start: number;
+      end: number;
+    }
+
+    const tableRanges: TableRange[] = [];
+    let rIdx = 0;
+    while (rIdx < finalCleanLines.length) {
+      if (isFinancialToken(finalCleanLines[rIdx])) {
+        const startRun = rIdx;
+        while (rIdx < finalCleanLines.length && isFinancialToken(finalCleanLines[rIdx])) {
+          rIdx++;
+        }
+        const endRun = rIdx - 1;
+        
+        if (endRun - startRun + 1 >= 4) {
+          let start = startRun;
+          while (start > 0) {
+            const prevLine = finalCleanLines[start - 1];
+            if (prevLine.length > 80 || prevLine.trim() === "" || prevLine.startsWith("[RowDivider]")) {
+              break;
+            }
+            start--;
+          }
           
-          highlightTerms.forEach(({ regex, className }) => {
-            // Find and wrap keywords
-            // Basic string replacement for rendering is simplified:
-            // Since this is read-only, we can render with standard styling or HTML parsing safely
-          });
+          let end = endRun;
+          while (end + 1 < finalCleanLines.length) {
+            const nextLine = finalCleanLines[end + 1];
+            if (nextLine.length > 80 || nextLine.trim() === "" || nextLine.startsWith("[RowDivider]")) {
+              break;
+            }
+            end++;
+          }
+          
+          let startsMidSentence = false;
+          if (start > 0) {
+            const prevLine = finalCleanLines[start - 1].trim();
+            const isPrevHeader = prevLine.length < 60 && !prevLine.includes("$") && !/\d/.test(prevLine) && (
+              prevLine === prevLine.toUpperCase() || isTitleCase(prevLine)
+            );
+            const endsWithColon = prevLine.endsWith(":");
+            if (!endsWithColon && !isPrevHeader && !prevLine.startsWith("[RowDivider]")) {
+              startsMidSentence = true;
+            }
+          }
+          
+          if (!startsMidSentence) {
+            tableRanges.push({ start, end });
+            rIdx = end + 1;
+          }
+        }
+      } else {
+        rIdx++;
+      }
+    }
+
+    interface FinalBlock {
+      type: "table" | "header" | "paragraph";
+      lines: string[];
+    }
+
+    const finalBlocks: FinalBlock[] = [];
+    let currentPos = 0;
+
+    for (const range of tableRanges) {
+      // Process lines preceding the table
+      while (currentPos < range.start) {
+        const line = finalCleanLines[currentPos];
+        currentPos++;
+        if (!line.trim()) continue;
+
+        const isHeader = line.length < 60 && !line.includes("$") && !/\d/.test(line) && (
+          line === line.toUpperCase() || isTitleCase(line)
+        );
+
+        if (isHeader) {
+          finalBlocks.push({ type: "header", lines: [line] });
+        } else {
+          if (finalBlocks.length > 0 && finalBlocks[finalBlocks.length - 1].type === "paragraph") {
+            finalBlocks[finalBlocks.length - 1].lines.push(line);
+          } else {
+            finalBlocks.push({ type: "paragraph", lines: [line] });
+          }
+        }
+      }
+
+      // Process the table range
+      const tableLines = finalCleanLines.slice(range.start, range.end + 1);
+      finalBlocks.push({ type: "table", lines: tableLines });
+      currentPos = range.end + 1;
+    }
+
+    // Process remaining lines after last table
+    while (currentPos < finalCleanLines.length) {
+      const line = finalCleanLines[currentPos];
+      currentPos++;
+      if (!line.trim()) continue;
+
+      const isHeader = line.length < 60 && !line.includes("$") && !/\d/.test(line) && (
+        line === line.toUpperCase() || isTitleCase(line)
+      );
+
+      if (isHeader) {
+        finalBlocks.push({ type: "header", lines: [line] });
+      } else {
+        if (finalBlocks.length > 0 && finalBlocks[finalBlocks.length - 1].type === "paragraph") {
+          finalBlocks[finalBlocks.length - 1].lines.push(line);
+        } else {
+          finalBlocks.push({ type: "paragraph", lines: [line] });
+        }
+      }
+    }
+
+    return (
+      <div className="space-y-4">
+        {finalBlocks.map((block, bIdx) => {
+          if (block.type === "table") {
+            const scannedRows: string[] = [];
+            let idxLine = 0;
+            while (idxLine < block.lines.length) {
+              const currentLine = block.lines[idxLine];
+              if (isFinancialToken(currentLine)) {
+                let merged = currentLine;
+                idxLine++;
+                while (idxLine < block.lines.length && isFinancialToken(block.lines[idxLine])) {
+                  merged += "   " + block.lines[idxLine];
+                  idxLine++;
+                }
+                merged = merged.replace(/\$\s+/g, "$");
+                scannedRows.push(merged);
+              } else {
+                let merged = currentLine;
+                idxLine++;
+                let gatheredTokens = false;
+                let tokensStr = "";
+                while (idxLine < block.lines.length && isFinancialToken(block.lines[idxLine])) {
+                  tokensStr += "   " + block.lines[idxLine];
+                  idxLine++;
+                  gatheredTokens = true;
+                }
+                if (gatheredTokens) {
+                  let fullRow = merged + "   " + tokensStr.trim();
+                  fullRow = fullRow.replace(/\$\s+/g, "$");
+                  scannedRows.push(fullRow);
+                } else {
+                  scannedRows.push(merged);
+                }
+              }
+            }
+
+            return (
+              <pre
+                key={bIdx}
+                className="text-[11px] text-slate-200 bg-slate-900/60 rounded-lg p-4 border border-slate-700/50 my-3 font-mono leading-7 overflow-x-auto"
+              >
+                {renderTextWithHighlight(scannedRows.join("\n"))}
+              </pre>
+            );
+          }
+
+          if (block.type === "header") {
+            return (
+              <div key={bIdx} className="space-y-1">
+                {block.lines.map((line, lIdx) => (
+                  <p
+                    key={`${bIdx}-${lIdx}`}
+                    className="text-indigo-300 font-semibold text-[12px] tracking-wide mt-5 mb-1"
+                  >
+                    {renderTextWithHighlight(line)}
+                  </p>
+                ))}
+              </div>
+            );
+          }
+
+          // Normal Paragraphs sentence-joining logic
+          const paragraphs: React.ReactNode[] = [];
+          let currentParagraph = "";
+
+          for (const line of block.lines) {
+            if (line.startsWith("[MutedHeader]:")) {
+              if (currentParagraph) {
+                paragraphs.push(
+                  <p
+                    key={paragraphs.length}
+                    className="text-slate-300 text-[12px] leading-7 font-light mb-3"
+                  >
+                    {renderTextWithHighlight(currentParagraph)}
+                  </p>
+                );
+                currentParagraph = "";
+              }
+              const cleanText = line.substring("[MutedHeader]:".length);
+              paragraphs.push(
+                <p key={paragraphs.length} className="text-slate-500 text-[10px] italic mb-2">
+                  [Table header: {renderTextWithHighlight(cleanText)}]
+                </p>
+              );
+            } else if (line.startsWith("[RowDivider]:")) {
+              if (currentParagraph) {
+                paragraphs.push(
+                  <p
+                    key={paragraphs.length}
+                    className="text-slate-300 text-[12px] leading-7 font-light mb-3"
+                  >
+                    {renderTextWithHighlight(currentParagraph)}
+                  </p>
+                );
+                currentParagraph = "";
+              }
+              const cleanText = line.substring("[RowDivider]:".length);
+              paragraphs.push(
+                <p key={paragraphs.length} className="text-indigo-200 font-semibold text-[11px] mt-3 mb-1 border-t border-slate-800 pt-2">
+                  {renderTextWithHighlight(cleanText)}
+                </p>
+              );
+            } else if (line.startsWith("[RowDividerValues]:")) {
+              if (currentParagraph) {
+                paragraphs.push(
+                  <p
+                    key={paragraphs.length}
+                    className="text-slate-300 text-[12px] leading-7 font-light mb-3"
+                  >
+                    {renderTextWithHighlight(currentParagraph)}
+                  </p>
+                );
+                currentParagraph = "";
+              }
+              const cleanText = line.substring("[RowDividerValues]:".length);
+              paragraphs.push(
+                <p key={paragraphs.length} className="text-slate-300 text-[11px] font-mono pl-4 mb-1">
+                  {renderTextWithHighlight(cleanText)}
+                </p>
+              );
+            } else if (line.startsWith("[LabelledRow]:")) {
+              if (currentParagraph) {
+                paragraphs.push(
+                  <p
+                    key={paragraphs.length}
+                    className="text-slate-300 text-[12px] leading-7 font-light mb-3"
+                  >
+                    {renderTextWithHighlight(currentParagraph)}
+                  </p>
+                );
+                currentParagraph = "";
+              }
+              const cleanText = line.substring("[LabelledRow]:".length);
+              paragraphs.push(
+                <pre key={paragraphs.length} className="text-[11px] text-slate-200 bg-slate-900/60 rounded-lg p-3 border border-slate-700/50 my-2 font-mono">
+                  {renderTextWithHighlight(cleanText)}
+                </pre>
+              );
+            } else {
+              if (currentParagraph) {
+                currentParagraph += " " + line;
+              } else {
+                currentParagraph = line;
+              }
+
+              const endsWithPunctuation = /[.!?]$/.test(line);
+              if (endsWithPunctuation) {
+                paragraphs.push(
+                  <p
+                    key={paragraphs.length}
+                    className="text-slate-300 text-[12px] leading-7 font-light mb-3"
+                  >
+                    {renderTextWithHighlight(currentParagraph)}
+                  </p>
+                );
+                currentParagraph = "";
+              }
+            }
+          }
+          if (currentParagraph) {
+            paragraphs.push(
+              <p
+                key={paragraphs.length}
+                className="text-slate-300 text-[12px] leading-7 font-light mb-3"
+              >
+                {renderTextWithHighlight(currentParagraph)}
+              </p>
+            );
+          }
 
           return (
-            <p key={pIdx} className="leading-7 font-light">
-              {paragraph}
-            </p>
+            <div key={bIdx} className="space-y-3">
+              {paragraphs}
+            </div>
           );
         })}
       </div>
@@ -647,7 +1085,7 @@ export default function Home() {
                         <div className="mt-2.5 pt-2.5 border-t border-indigo-900/40 space-y-1">
                           <span className="text-[9px] text-indigo-400 font-semibold block uppercase">Retrieved Citations:</span>
                           <div className="flex flex-wrap gap-1">
-                            {msg.citations.map((cit, cIdx) => (
+                            {msg.citations.map((cit: any, cIdx: number) => (
                               <button
                                 key={cIdx}
                                 onClick={() => handleRiskCardClick(cit.content, `highlight-${cit.company}-${cit.chunk_index}`)}
@@ -815,7 +1253,7 @@ export default function Home() {
                 {/* Radar Chart Visualizing Cautiousness, Uncertainty, Pessimism, Optimism */}
                 <div className="col-span-12 md:col-span-8 h-full flex items-center justify-center">
                   <div className="w-full h-full min-h-[140px]">
-                    <ResponsiveContainer width="100%" height="100%">
+                    <ResponsiveContainer width="100%" height={140} minWidth={0}>
                       <RadarChart cx="50%" cy="50%" outerRadius="80%" data={getRadarData()}>
                         <PolarGrid stroke="rgba(99, 102, 241, 0.15)" />
                         <PolarAngleAxis dataKey="subject" stroke="#a5b4fc" fontSize={9} />
@@ -865,7 +1303,7 @@ export default function Home() {
                   <p className="text-xs text-slate-400">Risk profiles will compile once a filing report is loaded.</p>
                 </div>
               ) : (
-                (activeReport.result?.risks ?? []).map((risk, index) => {
+                (activeReport.result?.risks ?? []).map((risk: any, index: number) => {
                   const highlightId = `highlight-${activeReport.company_name}-${index}`;
                   const isActive = activeHighlightId === highlightId;
                   
