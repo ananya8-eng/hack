@@ -62,8 +62,13 @@ Dashboard + Chatbot
 | Styling | Tailwind CSS |
 | Backend | FastAPI |
 | Agent Framework | LangGraph |
+<<<<<<< HEAD
 | Main AI Model | Qwen2.5 3B Instruct |
 | LLM Runtime | Ollam(locally running) -> nvdia->grok->huggingface->gemini (one serves as fallback when preceeding privider fails) |
+=======
+| Main AI Model | Qwen2.5 7B Instruct |
+| LLM Runtime | Ollama |
+>>>>>>> e9f92d154254dc63c9b771aa7dc8357d06ea697f
 | Embeddings | BAAI/bge-large-en-v1.5 |
 | Vector Database | ChromaDB |
 | PDF Parsing | PyMuPDF |

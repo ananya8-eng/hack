@@ -1,7 +1,8 @@
-import re
-import json
 import logging
-import requests
+import re
+
+from backend.agents.llm_client import llm_client
+from backend.guardrails import guardrails
 from backend.tools.chroma_tool import chromadb_manager
 
 logger = logging.getLogger(__name__)
@@ -92,33 +93,18 @@ def generate_heuristic_rag_answer(query: str, chunks: list) -> dict:
     }
 
 class RAGChatbot:
-    def __init__(self, ollama_url="http://localhost:11434/api/generate"):
-        self.ollama_url = ollama_url
-        self.model_name = "qwen2.5:3b-instruct"
-
-    def _call_ollama(self, prompt: str) -> str:
-        try:
-            response = requests.post(
-                self.ollama_url,
-                json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.1}
-                },
-                timeout=12
-            )
-            if response.status_code == 200:
-                return response.json().get("response", "")
-            return ""
-        except Exception:
-            return ""
-
     def query_chatbot(self, user_question: str, company_name: str = None) -> dict:
         """
         Retrieves top relevant chunks from ChromaDB and uses Qwen (or Heuristic RAG)
         to answer with precise inline citations, avoiding hallucinations.
         """
+        input_guard = guardrails.check_chat_message(user_question)
+        if not input_guard.allowed:
+            payload = input_guard.to_api_payload()
+            payload["mode"] = "rag"
+            return payload
+
+        user_question = input_guard.sanitized_text or user_question
         logger.info(f"RAG Chatbot processing question: '{user_question}'...")
         
         # Determine query filter
@@ -169,8 +155,26 @@ class RAGChatbot:
         Synthesize your comprehensive response with citations.
         """
 
-        response_text = self._call_ollama(prompt)
-        
+        response_text = llm_client.generate(prompt, temperature=0.1, timeout=60)
+
+        if not response_text:
+            return {
+                "answer": (
+                    "I could not produce a safe, evidence-backed answer. "
+                    "Rephrase your filing question or try again."
+                ),
+                "citations": [],
+                "success": False,
+                "guardrail_blocked": True,
+            }
+
+        output_guard = guardrails.check_llm_text_output(response_text)
+        if not output_guard.allowed:
+            payload = output_guard.to_api_payload()
+            payload["mode"] = "rag"
+            return payload
+        response_text = output_guard.sanitized_text or response_text
+
         if response_text and len(response_text.strip()) > 50:
             # Build citations list for UI display
             citations = []
@@ -198,7 +202,15 @@ class RAGChatbot:
         # HEURISTIC RAG FALLBACK
         # ==========================================
         logger.info("Executing Heuristic RAG Q&A Engine...")
-        return generate_heuristic_rag_answer(user_question, chunks)
+        heuristic = generate_heuristic_rag_answer(user_question, chunks)
+        out_guard = guardrails.check_llm_text_output(heuristic.get("answer", ""))
+        if not out_guard.allowed:
+            payload = out_guard.to_api_payload()
+            payload["mode"] = "rag"
+            return payload
+        if out_guard.sanitized_text:
+            heuristic = {**heuristic, "answer": out_guard.sanitized_text}
+        return heuristic
 
 # Singleton helper
 rag_chatbot = RAGChatbot()

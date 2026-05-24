@@ -1,0 +1,389 @@
+"""
+Unified LLM client for agent orchestration.
+
+Provider order (cloud APIs only — Ollama is intentionally excluded):
+  NVIDIA → Grok → HuggingFace → Gemini.
+
+`generate()` uses the first provider that returns non-empty text.
+`generate_json()` walks the full chain when a provider returns text that
+does not parse as JSON (malformed JSON does not block fallback).
+"""
+from __future__ import annotations
+
+import json
+import logging
+from typing import Callable, Optional
+
+STRICT_JSON_SUFFIX = (
+    "\n\nCRITICAL: Respond with ONLY a valid JSON object. "
+    "No markdown, no code fences, no prose before or after. "
+    "The entire response must parse with json.loads()."
+)
+
+import requests
+
+from backend.config import get_settings
+from backend.guardrails import guardrails
+
+logger = logging.getLogger(__name__)
+
+
+class LLMClient:
+    def __init__(self) -> None:
+        settings = get_settings()
+        self.nvidia_api_key = settings.nvidia_api_key
+        self.nvidia_base_url = settings.nvidia_api_base_url
+        self.nvidia_model = settings.nvidia_model
+        self.grok_api_key = settings.grok_api_key
+        self.grok_base_url = settings.grok_api_base_url
+        self.grok_model = settings.grok_model
+        self.hf_api_key = settings.huggingface_api_key
+        self.hf_model = settings.huggingface_model
+        self.hf_inference_url = settings.huggingface_inference_url
+        self.gemini_api_key = settings.gemini_api_key
+        self.gemini_model = settings.gemini_model
+        self.default_timeout = settings.llm_default_timeout
+
+    def _provider_chain(
+        self,
+        prompt: str,
+        temperature: float,
+        timeout: int,
+    ) -> list[tuple[str, Callable[[], str]]]:
+        """
+        Ordered LLM providers. Ollama/local runtimes are not included — use cloud APIs only.
+        """
+        return [
+            ("nvidia", lambda: self._nvidia(prompt, temperature, timeout)),
+            ("grok", lambda: self._grok(prompt, temperature, timeout)),
+            (
+                "huggingface",
+                lambda: self._huggingface(prompt, temperature, timeout),
+            ),
+            ("gemini", lambda: self._gemini(prompt, temperature, timeout)),
+        ]
+
+    def _invoke_provider(
+        self,
+        provider_name: str,
+        prompt: str,
+        temperature: float,
+        timeout: int,
+    ) -> str:
+        dispatch: dict[str, Callable[[], str]] = {
+            "nvidia": lambda: self._nvidia(prompt, temperature, timeout),
+            "grok": lambda: self._grok(prompt, temperature, timeout),
+            "huggingface": lambda: self._huggingface(prompt, temperature, timeout),
+            "gemini": lambda: self._gemini(prompt, temperature, timeout),
+        }
+        fn = dispatch.get(provider_name)
+        if not fn:
+            return ""
+        try:
+            text = fn()
+            if text and text.strip():
+                logger.info("LLM response from provider: %s", provider_name)
+                return text.strip()
+        except Exception as exc:
+            logger.debug("LLM provider %s unavailable: %s", provider_name, exc)
+        return ""
+
+    def _call_provider(self, name: str, fn: Callable[[], str]) -> str:
+        try:
+            text = fn()
+            if text and text.strip():
+                logger.info("LLM response from provider: %s", name)
+                return text.strip()
+        except Exception as exc:
+            logger.debug("LLM provider %s unavailable: %s", name, exc)
+        return ""
+
+    def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.1,
+        timeout: int | None = None,
+    ) -> str:
+        prompt_check = guardrails.prepare_llm_prompt(prompt)
+        if not prompt_check.allowed:
+            logger.warning(
+                "Guardrails blocked LLM prompt: %s",
+                [v.code for v in prompt_check.violations],
+            )
+            return ""
+        safe_prompt = prompt_check.sanitized_text or prompt
+
+        effective_timeout = timeout if timeout is not None else self.default_timeout
+        for name, fn in self._provider_chain(
+            safe_prompt, temperature, effective_timeout
+        ):
+            text = self._call_provider(name, fn)
+            if text:
+                output_check = guardrails.check_llm_text_output(text)
+                if output_check.allowed:
+                    return output_check.sanitized_text or text
+                logger.warning(
+                    "Guardrails blocked LLM output from %s: %s",
+                    name,
+                    [v.code for v in output_check.violations],
+                )
+        logger.warning("All LLM providers failed or returned empty")
+        return ""
+
+    def generate_json(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.1,
+        timeout: int | None = None,
+        max_attempts: int = 2,
+        validator: Callable[[dict], bool] | None = None,
+    ) -> Optional[dict]:
+        """
+        Parse JSON from LLM output, walking the provider chain on failure.
+
+        For each provider (NVIDIA → Grok → HuggingFace → Gemini), retries up to
+        `max_attempts` times when the response is empty or not valid JSON, then
+        advances to the next provider. Ollama is not part of this chain.
+        """
+        effective_timeout = timeout if timeout is not None else self.default_timeout
+        base_prompt = prompt.rstrip()
+        if "json.loads()" not in base_prompt:
+            base_prompt = f"{base_prompt}{STRICT_JSON_SUFFIX}"
+
+        prompt_check = guardrails.prepare_llm_prompt(base_prompt)
+        if not prompt_check.allowed:
+            logger.warning(
+                "Guardrails blocked JSON LLM prompt: %s",
+                [v.code for v in prompt_check.violations],
+            )
+            return None
+        base_prompt = prompt_check.sanitized_text or base_prompt
+
+        provider_names = [name for name, _ in self._provider_chain(
+            base_prompt, temperature, effective_timeout
+        )]
+        for provider_idx, provider_name in enumerate(provider_names):
+            for attempt in range(1, max_attempts + 1):
+                attempt_prompt = base_prompt
+                if attempt > 1:
+                    attempt_prompt = (
+                        f"{base_prompt}\n\n"
+                        f"[Retry {attempt}/{max_attempts} on {provider_name}] "
+                        "Your previous reply was not valid JSON. "
+                        "Output ONLY a single JSON object. No markdown fences or extra text."
+                    )
+
+                response_text = self._invoke_provider(
+                    provider_name, attempt_prompt, temperature, effective_timeout
+                )
+                parsed = parse_json_from_llm(response_text) if response_text else None
+                if parsed is not None and (validator is None or validator(parsed)):
+                    json_guard = guardrails.check_llm_json_output(parsed)
+                    if not json_guard.allowed:
+                        logger.warning(
+                            "Guardrails blocked JSON from %s: %s",
+                            provider_name,
+                            [v.code for v in json_guard.violations],
+                        )
+                        parsed = None
+                    else:
+                        if attempt > 1 or provider_idx > 0:
+                            logger.info(
+                                "LLM returned parseable JSON from %s (attempt %s)",
+                                provider_name,
+                                attempt,
+                            )
+                        return parsed
+                if parsed is not None:
+                    continue
+
+                if attempt < max_attempts:
+                    logger.warning(
+                        "LLM JSON parse failed on %s (attempt %s/%s); retrying same provider",
+                        provider_name,
+                        attempt,
+                        max_attempts,
+                    )
+
+            if provider_idx < len(provider_names) - 1:
+                next_name = provider_names[provider_idx + 1]
+                logger.warning(
+                    "Provider %s did not return valid JSON after %s attempt(s); "
+                    "falling back to %s",
+                    provider_name,
+                    max_attempts,
+                    next_name,
+                )
+
+        logger.warning(
+            "LLM did not return valid JSON after trying all cloud providers "
+            "(ollama excluded from chain)"
+        )
+        return None
+
+    def _openai_compatible_chat(
+        self,
+        url: str,
+        api_key: str,
+        model: str,
+        prompt: str,
+        temperature: float,
+        timeout: int,
+    ) -> str:
+        if not api_key:
+            return ""
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+            },
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            return ""
+        payload = response.json()
+        choices = payload.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        return message.get("content", "")
+
+    def _nvidia(self, prompt: str, temperature: float, timeout: int) -> str:
+        return self._openai_compatible_chat(
+            self.nvidia_base_url,
+            self.nvidia_api_key,
+            self.nvidia_model,
+            prompt,
+            temperature,
+            timeout,
+        )
+
+    def _grok(self, prompt: str, temperature: float, timeout: int) -> str:
+        return self._openai_compatible_chat(
+            self.grok_base_url,
+            self.grok_api_key,
+            self.grok_model,
+            prompt,
+            temperature,
+            timeout,
+        )
+
+    def _huggingface(self, prompt: str, temperature: float, timeout: int) -> str:
+        if not self.hf_api_key:
+            return ""
+        response = requests.post(
+            self.hf_inference_url,
+            headers={"Authorization": f"Bearer {self.hf_api_key}"},
+            json={
+                "inputs": prompt,
+                "parameters": {"max_new_tokens": 2048, "temperature": temperature},
+            },
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            return ""
+        payload = response.json()
+        if isinstance(payload, list) and payload:
+            generated = payload[0].get("generated_text", "")
+            if generated.startswith(prompt):
+                return generated[len(prompt) :].strip()
+            return generated
+        if isinstance(payload, dict):
+            return payload.get("generated_text", "")
+        return ""
+
+    def _gemini(self, prompt: str, temperature: float, timeout: int) -> str:
+        if not self.gemini_api_key:
+            return ""
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.gemini_model}:generateContent?key={self.gemini_api_key}"
+        )
+        response = requests.post(
+            url,
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": temperature},
+            },
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            return ""
+        payload = response.json()
+        candidates = payload.get("candidates") or []
+        if not candidates:
+            return ""
+        content = candidates[0].get("content") or {}
+        parts = content.get("parts") or []
+        if not parts:
+            return ""
+        return parts[0].get("text", "")
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    """Extract the first balanced JSON object from model output."""
+    import re
+
+    fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
+    if fenced:
+        return fenced.group(1).strip()
+
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def parse_json_from_llm(text: str) -> Optional[dict]:
+    if not text or not text.strip():
+        return None
+
+    stripped = text.strip()
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    candidate = _extract_json_object(stripped)
+    if not candidate:
+        logger.debug("LLM output contained no parseable JSON object")
+        return None
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError as exc:
+        logger.debug("LLM JSON parse failed: %s", exc)
+        return None
+
+
+llm_client = LLMClient()

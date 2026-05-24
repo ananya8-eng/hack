@@ -1,45 +1,41 @@
-import os
 import re
-import json
 import logging
-import requests
+
+from backend.agents.llm_client import llm_client
 
 logger = logging.getLogger(__name__)
 
 class ValidatorAgent:
-    def __init__(self, ollama_url="http://localhost:11434/api/generate"):
-        self.ollama_url = ollama_url
-        self.model_name = "qwen2.5:3b-instruct"
 
-    def _call_ollama(self, prompt: str) -> str:
-        try:
-            response = requests.post(
-                self.ollama_url,
-                json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.0}
-                },
-                timeout=10
-            )
-            if response.status_code == 200:
-                return response.json().get("response", "")
-            return ""
-        except Exception:
-            return ""
-
-    def validate_scraped_content(self, scraped_data: dict, target_company: str, target_competitors: list) -> dict:
+    def validate_scraped_content(
+        self,
+        scraped_data: dict,
+        target_company: str,
+        target_competitors: list,
+        scrape_requests: list | None = None,
+    ) -> dict:
         """
         Validates scraped data before integration into the context window.
-        Uses Qwen via Ollama if available, otherwise executes deterministic validation rules.
+        Uses the configured LLM chain (NVIDIA first), otherwise executes deterministic validation rules.
         """
         text = scraped_data.get("text", "")
         source = scraped_data.get("source", "Unknown")
         scraped_company = scraped_data.get("company", "Unknown").upper().strip()
         filing_type = scraped_data.get("filing_type", "10-K").upper().strip()
+        search_query = scraped_data.get("search_query", "")
+        is_web = filing_type == "WEB" or bool(search_query)
 
         logger.info(f"Validator Agent auditing source: {source} ({scraped_company})...")
+
+        plan_summary = ""
+        if scrape_requests:
+            plan_lines = []
+            for req in scrape_requests:
+                plan_lines.append(
+                    f"- {req.get('type')}: company={req.get('company')}, "
+                    f"query={req.get('query', '')[:120]}, purpose={req.get('purpose', '')}"
+                )
+            plan_summary = "\n".join(plan_lines)
 
         prompt = f"""
         [System] You are an elite AI Financial Compliance and Validator Agent.
@@ -48,6 +44,9 @@ class ValidatorAgent:
         [Target Profile]
         Target Company: {target_company}
         Allowed Competitors/Peers: {", ".join(target_competitors)}
+        Agent Scrape Plan:
+        {plan_summary or "N/A"}
+        Web Search Query (if any): {search_query or "N/A"}
         
         [Scraped Document Metadata]
         Source: {source}
@@ -69,16 +68,9 @@ class ValidatorAgent:
         }}
         """
 
-        response_text = self._call_ollama(prompt)
-        
-        if response_text:
-            try:
-                json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
-                if json_match:
-                    return json.loads(json_match.group(0))
-                return json.loads(response_text)
-            except Exception as e:
-                logger.error(f"Error parsing Qwen validator response: {str(e)}. Defaulting to compliance engine.")
+        parsed = llm_client.generate_json(prompt, temperature=0.0)
+        if parsed:
+            return parsed
 
         # ==========================================
         # DETERMINISTIC VALIDATION FALLBACK
@@ -100,20 +92,40 @@ class ValidatorAgent:
             is_valid = False
             rejection_reason = "Scraped content is too short or empty, indicating a failed download or empty document."
             relevance_score = 0.0
-            
-        # Rule 2: Verify Company Relevance
-        # If the scraped company is neither the target nor in the competitor list
-        elif scraped_company != "UNKNOWN" and scraped_company != company_clean and scraped_company not in allowed_comps_upper:
-            # Let's double check if there are mentions inside the text in case the declared company metadata was a loose match
-            mentions_target = len(re.findall(rf"\b{company_clean}\b", text.upper()))
-            mentions_comps = sum(len(re.findall(rf"\b{c}\b", text.upper())) for c in allowed_comps_upper)
-            
+
+        # Rule 2: Company relevance (relaxed for web_search enrichment)
+        elif is_web:
+            query_tokens = [
+                w for w in re.split(r"\W+", (search_query or "").lower()) if len(w) > 3
+            ]
+            token_hits = sum(1 for w in query_tokens if w in text_lower)
+            target_hits = len(re.findall(rf"\b{re.escape(company_clean)}\b", text.upper()))
+            if token_hits >= 1 or target_hits >= 1 or len(text.strip()) >= 500:
+                relevance_score = max(relevance_score, 0.75)
+            else:
+                relevance_score = 0.45
+
+        elif (
+            scraped_company != "UNKNOWN"
+            and scraped_company != company_clean
+            and scraped_company not in allowed_comps_upper
+            and scraped_company != "EXTERNAL"
+        ):
+            mentions_target = len(re.findall(rf"\b{re.escape(company_clean)}\b", text.upper()))
+            mentions_comps = sum(
+                len(re.findall(rf"\b{re.escape(c)}\b", text.upper()))
+                for c in allowed_comps_upper
+            )
+
             if mentions_target == 0 and mentions_comps == 0:
                 is_valid = False
-                rejection_reason = f"Company alignment mismatch. Document is about {scraped_company}, not target '{company_clean}' or competitors {allowed_comps_upper}."
+                rejection_reason = (
+                    f"Company alignment mismatch. Document is about {scraped_company}, "
+                    f"not target '{company_clean}' or planned peers {allowed_comps_upper}."
+                )
                 relevance_score = 0.1
             else:
-                relevance_score = 0.6 # Medium relevance due to presence of keywords
+                relevance_score = 0.6
         
         # Rule 3: Detect standard SPAM pages / generic login panels / error pages
         spam_keywords = ["404 not found", "access denied", "robot check", "captcha", "cookie policy", "sign in to your account", "paywall", "subscribe to read"]
@@ -131,11 +143,17 @@ class ValidatorAgent:
             if "EDGAR" in source.upper() or "FILING" in source.upper() or "SEC" in source.upper() or "GOV" in source.upper():
                 trust_source = True
                 relevance_score = max(relevance_score, 0.9)
-            elif "BLOG" in source.upper() or "WIKIPEDIA" in source.upper() or "FORUM" in source.upper():
+            elif (
+                not is_web
+                and (
+                    "BLOG" in source.upper()
+                    or "FORUM" in source.upper()
+                )
+            ):
                 trust_source = False
                 relevance_score = min(relevance_score, 0.5)
                 rejection_reason = "Rejected due to untrusted/unofficial source (e.g. blog or forum post)."
-                is_valid = False # Reject blogs to avoid noisy enrichment
+                is_valid = False
 
         # Rule 5: Freshness audit based on year markers (e.g. rejecting things from > 5 years ago if they declare high freshness)
         years_found = [int(y) for y in re.findall(r"\b(20\d{2})\b", text_lower)]
