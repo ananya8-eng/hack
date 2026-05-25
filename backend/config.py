@@ -70,10 +70,17 @@ class Settings:
     # Embeddings & vector store
     use_mock_embeddings: bool
     embedding_model: str
+    embedding_service_mode: str
     embedding_service_url: str
+    embedding_service_path: str
+    embedding_query_path: str
+    embedding_body_format: str
+    qdrant_url: str
+    qdrant_api_key: str
+    qdrant_collection: str
     embedding_service_api_key: str
     embedding_service_timeout: int
-    chroma_db_path: str
+    embedding_dimension: int
     preload_embeddings_on_startup: bool
     max_chunks_per_section: int
     max_chunks_per_filing: int
@@ -110,9 +117,12 @@ def get_settings() -> Settings:
     gemini_key = _env("GEMINI_API_KEY") or _env("GOOGLE_API_KEY")
     grok_key = _env("GROK_API_KEY") or _env("XAI_API_KEY")
 
+    # Render injects PORT; fall back to API_PORT for local/docker-compose.
+    api_port = _env_int("PORT", _env_int("API_PORT", 8000))
+
     return Settings(
         api_host=_env("API_HOST", "127.0.0.1"),
-        api_port=_env_int("API_PORT", 8000),
+        api_port=api_port,
         cors_origins=_env("CORS_ORIGINS", "*"),
         nvidia_api_key=_env("NVIDIA_API_KEY"),
         nvidia_api_base_url=_env(
@@ -135,11 +145,19 @@ def get_settings() -> Settings:
         gemini_model=_env("GEMINI_MODEL", "gemini-2.0-flash"),
         llm_default_timeout=_env_int("LLM_DEFAULT_TIMEOUT", 90),
         use_mock_embeddings=_env_bool("USE_MOCK_EMBEDDINGS", True),
-        embedding_model=_env("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5"),
+        embedding_model=_env("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
+        embedding_service_mode=_env("EMBEDDING_SERVICE_MODE", "qdrant").lower(),
         embedding_service_url=_env("EMBEDDING_SERVICE_URL", ""),
+        embedding_service_path=_env("EMBEDDING_SERVICE_PATH", "/embed"),
+        embedding_query_path=_env("EMBEDDING_QUERY_PATH")
+        or _env("EMBEDDING_ENCODE_PATH", "/query"),
+        embedding_body_format=_env("EMBEDDING_BODY_FORMAT", "text"),
         embedding_service_api_key=_env("EMBEDDING_SERVICE_API_KEY", ""),
         embedding_service_timeout=_env_int("EMBEDDING_SERVICE_TIMEOUT", 120),
-        chroma_db_path=_env("CHROMA_DB_PATH", "./chroma_db"),
+        embedding_dimension=_env_int("EMBEDDING_DIMENSION", 384),
+        qdrant_url=_env("QDRANT_URL", ""),
+        qdrant_api_key=_env("QDRANT_API_KEY", ""),
+        qdrant_collection=_env("QDRANT_COLLECTION", "documents"),
         preload_embeddings_on_startup=_env_bool("PRELOAD_EMBEDDINGS_ON_STARTUP", False),
         max_chunks_per_section=_env_int("MAX_CHUNKS_PER_SECTION", 80),
         max_chunks_per_filing=_env_int("MAX_CHUNKS_PER_FILING", 250),

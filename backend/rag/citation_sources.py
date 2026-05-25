@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 # UI-facing labels
 SOURCE_LABELS = {
-    "uploaded_filing": "Uploaded filing PDF (vector DB / ChromaDB)",
+    "uploaded_filing": "Uploaded filing PDF (vector DB / Qdrant)",
     "sec_edgar": "SEC EDGAR live scrape",
     "prior_filing": "Prior-period SEC filing scrape",
     "web_search": "Web search scrape",

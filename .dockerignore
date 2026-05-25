@@ -1,0 +1,41 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets & local env
+.env
+.env.*
+!.env.docker.example
+!embedding-server/.env.example
+!frontend/.env.example
+
+# Git & IDE
+.git/
+.gitignore
+.cursor/
+
+# Frontend dev artifacts
+frontend/node_modules/
+frontend/.next/
+
+# Local data & caches
+chroma_db/
+scraped_filings/
+*.sqlite3
+
+# Docs & misc (not needed in images)
+docs/
+*.md
+!embedding-server/README.md
+
+# Embedding-server has its own compose overlay (optional local dev)
+embedding-server/
+docker-compose.embedding.yml
+
+# Next dev output at repo root (if any)
+frontend/.next/

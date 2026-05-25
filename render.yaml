@@ -1,0 +1,83 @@
+# Render Blueprint — backend + frontend (Docker).
+# Embedding service runs on your own machine; set EMBEDDING_SERVICE_URL in the Render dashboard.
+#
+# Deploy:
+#   1. Push this repo to GitHub
+#   2. https://dashboard.render.com/select-repo?type=blueprint
+#   3. Add secret env vars marked sync: false (API keys, Qdrant, embedding URL)
+#
+# Or authorize the Render MCP plugin in Cursor and re-run deploy from the agent.
+
+services:
+  - type: web
+    name: aegis-api
+    runtime: docker
+    region: oregon
+    plan: starter
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: API_HOST
+        value: 0.0.0.0
+      - key: EMBEDDING_SERVICE_MODE
+        value: qdrant
+      - key: USE_MOCK_EMBEDDINGS
+        value: false
+      - key: EMBEDDING_SERVICE_PATH
+        value: /embed
+      - key: EMBEDDING_QUERY_PATH
+        value: /query
+      - key: EMBEDDING_BODY_FORMAT
+        value: text
+      - key: SCRAPED_FILINGS_DIR
+        value: /app/scraped_filings
+      - key: GUARDRAILS_ENABLED
+        value: true
+      # Set to your aegis-web URL after first deploy, or use * for the hackathon demo
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: GROK_API_KEY
+        sync: false
+      - key: XAI_API_KEY
+        sync: false
+      - key: HUGGINGFACE_API_KEY
+        sync: false
+      - key: HF_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: EMBEDDING_SERVICE_URL
+        sync: false
+      - key: EMBEDDING_SERVICE_API_KEY
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: SEC_EDGAR_EMAIL
+        sync: false
+
+  - type: web
+    name: aegis-web
+    runtime: docker
+    region: oregon
+    plan: starter
+    branch: main
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    autoDeploy: true
+    envVars:
+      - key: NEXT_PUBLIC_API_BASE_URL
+        fromService:
+          type: web
+          name: aegis-api
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: NEXT_PUBLIC_PIPELINE_POLL_TIMEOUT_MS
+        value: "900000"

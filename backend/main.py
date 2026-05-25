@@ -30,9 +30,14 @@ async def health_check():
         "service": "aegis-financial-api",
         "guardrails_enabled": settings.guardrails_enabled,
         "embeddings": (
-            "remote"
+            "qdrant-remote"
             if settings.embedding_service_url
-            else ("mock" if settings.use_mock_embeddings else "unset")
+            and settings.embedding_service_mode in ("qdrant", "qdrant_store", "store")
+            else (
+                "remote"
+                if settings.embedding_service_url
+                else ("mock" if settings.use_mock_embeddings else "unset")
+            )
         ),
     }
 
@@ -45,9 +50,13 @@ def _configure_runtime_logging() -> None:
         logger.info("Initializing embedding client at startup...")
         embedding_manager.initialize()
     elif settings.embedding_service_url:
+        embedding_manager.initialize()
+        mode = "qdrant-remote" if embedding_manager.uses_qdrant_remote() else "vectors-remote"
         logger.info(
-            "Remote embedding service configured (%s); skipping local preload.",
+            "Remote embedding service at %s%s — mode=%s.",
             settings.embedding_service_url.rstrip("/"),
+            settings.embedding_service_path,
+            mode,
         )
 
 

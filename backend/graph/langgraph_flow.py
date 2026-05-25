@@ -24,7 +24,7 @@ from backend.config import get_settings
 from backend.extraction.section_extractor import SectionExtractionError, discover_sections
 from backend.extraction.section_models import FilingSection, sections_catalog, sections_to_text_map
 from backend.rag.chunking import split_text_into_chunks
-from backend.tools.chroma_tool import chromadb_manager
+from backend.tools.vector_store import vector_store as chromadb_manager
 from backend.tools.scrape_plan import companies_from_requests, resolve_request_tickers
 from backend.tools.scraper import financial_scraper
 from backend.extraction.margin_trends import compute_margin_trends

@@ -18,7 +18,7 @@ from backend.rag.citation_sources import (
     sanitize_competitor_benchmarks,
     summarize_source_types,
 )
-from backend.tools.chroma_tool import chromadb_manager
+from backend.tools.vector_store import vector_store as chromadb_manager
 from backend.extraction.margin_trends import compute_margin_trends
 from backend.tools.scrape_plan import (
     companies_from_requests,

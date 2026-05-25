@@ -1,0 +1,58 @@
+# App stack only — embedding runs on a separate host (set EMBEDDING_SERVICE_URL in .env).
+#
+#   docker compose build
+#   docker compose up
+#
+# Optional local embedding (not used when remote URL is configured):
+#   docker compose -f docker-compose.yml -f docker-compose.embedding.yml --profile embedding up
+
+name: aegis
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aegis-backend:latest
+    ports:
+      - "${API_PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      API_HOST: 0.0.0.0
+      PORT: "8000"
+      SCRAPED_FILINGS_DIR: /app/scraped_filings
+    volumes:
+      - scraped_filings:/app/scraped_filings
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\", \"8000\")}/api/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+        NEXT_PUBLIC_PIPELINE_POLL_TIMEOUT_MS: ${NEXT_PUBLIC_PIPELINE_POLL_TIMEOUT_MS:-900000}
+    image: aegis-frontend:latest
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  scraped_filings:

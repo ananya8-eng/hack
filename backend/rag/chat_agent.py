@@ -26,7 +26,7 @@ from backend.rag.citation_sources import (
 )
 from backend.rag.chat_comparison import _format_comparison_answer
 from backend.rag.chunking import split_text_into_chunks
-from backend.tools.chroma_tool import chromadb_manager
+from backend.tools.vector_store import vector_store as chromadb_manager
 from backend.tools.scrape_plan import is_plausible_peer_name
 from backend.tools.scraper import financial_scraper
 
@@ -37,7 +37,7 @@ AGENT_TOOLS: List[Dict[str, Any]] = [
     {
         "name": "rag_retrieve",
         "description": (
-            "Semantic search over the uploaded filing stored in ChromaDB. "
+            "Semantic search over the uploaded filing stored in Qdrant. "
             "Use first for questions answerable from the PDF (risks, competitors "
             "named in the filing, MD&A, performance narrative)."
         ),

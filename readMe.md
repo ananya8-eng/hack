@@ -4,7 +4,7 @@ An adaptive financial filing intelligence platform for **10-K / 10-Q PDFs**. Upl
 
 ## What it does
 
-- **Upload & ingest** — PDF text extraction (PyMuPDF), narrative section discovery, chunking, and ChromaDB indexing (`BAAI/bge-large-en-v1.5` embeddings).
+- **Upload & ingest** — PDF text extraction (PyMuPDF), narrative section discovery, chunking, and Qdrant Cloud indexing via the embedding service.
 - **Map-reduce analysis** — Financial intelligence agent analyzes sections in parallel, then synthesizes risks, severity, sentiment, and summaries.
 - **Agentic scraping** — When context is thin or the user asks for comparisons, the graph plans targets, fetches filings via `sec-edgar-downloader`, and validates sources before re-analysis.
 - **Comparative insights** — Cross-filing benchmarks, tone shifts, and peer comparisons grounded in retrieved text (no fabricated financial tables).
@@ -20,7 +20,7 @@ An adaptive financial filing intelligence platform for **10-K / 10-Q PDFs**. Upl
 | Orchestration | LangGraph |
 | LLM | Cloud APIs with fallback: **NVIDIA NIM → Grok → Hugging Face → Gemini** |
 | Embeddings | Remote service (`embedding-server/`) or mock vectors locally |
-| Vector DB | ChromaDB (persistent under `./chroma_db`) |
+| Vector DB | Qdrant Cloud (via `embedding-server/`) |
 | PDF | PyMuPDF |
 | SEC data | `sec-edgar-downloader` |
 
@@ -32,7 +32,7 @@ An adaptive financial filing intelligence platform for **10-K / 10-Q PDFs**. Upl
 - **Node.js** 20+ and npm
 - **API keys** — at least one of: `NVIDIA_API_KEY`, `GROK_API_KEY` / `XAI_API_KEY`, `HUGGINGFACE_API_KEY` / `HF_TOKEN`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`
 - **SEC EDGAR** — `SEC_EDGAR_EMAIL` (required by SEC fair-access policy when downloading filings)
-- Disk space for ChromaDB on the API host; embedding model runs on a **separate host** (see `embedding-server/`) unless `USE_MOCK_EMBEDDINGS=true`
+- **Qdrant Cloud** credentials on the embedding host (see `embedding-server/.env.example`); use `USE_MOCK_EMBEDDINGS=true` only for local dev without Qdrant
 
 ## Quick start
 
@@ -121,11 +121,17 @@ Scraped SEC filings are stored under `./scraped_filings` (gitignored).
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | — | Google Gemini fallback |
 | `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model |
 | `LLM_DEFAULT_TIMEOUT` | `90` | Per-request LLM timeout (seconds) |
-| `EMBEDDING_SERVICE_URL` | — | Remote embedding API base (e.g. `http://embed-host:8088`) — **required for AWS** |
-| `EMBEDDING_SERVICE_API_KEY` | — | `X-API-Key` for the embedding nginx service |
+| `EMBEDDING_SERVICE_URL` | — | Embedding server base (e.g. `http://127.0.0.1:8088`) — **required for production** |
+| `EMBEDDING_SERVICE_MODE` | `qdrant` | `qdrant`: `/embed` indexes into Qdrant; backend searches Qdrant directly |
+| `EMBEDDING_SERVICE_PATH` | `/embed` | POST path to embed + store a chunk in Qdrant |
+| `EMBEDDING_QUERY_PATH` | `/query` | POST path to embed a user search query (vectors only; backend searches Qdrant) |
+| `QDRANT_URL` | — | Qdrant Cloud URL — **required on backend for search** |
+| `QDRANT_API_KEY` | — | Qdrant Cloud API key |
+| `QDRANT_COLLECTION` | `documents` | Collection name (must match embedding-server) |
+| `EMBEDDING_BODY_FORMAT` | `text` | `text` = `{"text":"..."}` per request; `texts` = batch `{"texts":[...]}` |
+| `EMBEDDING_SERVICE_API_KEY` | — | `X-API-Key` for the embedding service |
 | `EMBEDDING_SERVICE_TIMEOUT` | `120` | HTTP timeout (seconds) for embedding batches |
-| `USE_MOCK_EMBEDDINGS` | `true` | Deterministic mock vectors (local dev; ignored if `EMBEDDING_SERVICE_URL` is set) |
-| `CHROMA_DB_PATH` | `./chroma_db` | Chroma persistence directory |
+| `USE_MOCK_EMBEDDINGS` | `true` | In-memory vectors only when `EMBEDDING_SERVICE_URL` is unset |
 | `PRELOAD_EMBEDDINGS_ON_STARTUP` | `false` | Warm up embedding client at startup |
 | `SEC_EDGAR_EMAIL` | — | **Required** for SEC downloads |
 | `SEC_EDGAR_COMPANY_NAME` | `AegisFinancialAgent` | SEC downloader user-agent identity |
@@ -155,7 +161,7 @@ Frontend (`frontend/.env.local`):
 
 ```text
 Upload PDF
-    → discover sections → chunk & index (ChromaDB)
+    → discover sections → chunk & index (Qdrant)
     → map-reduce financial analysis
     → [optional] scrape SEC / web → validate → comparative re-analysis
     → finalize → dashboard + chat
@@ -166,9 +172,41 @@ Upload PDF
 - **Financial intelligence agent** — Risk/sentiment analysis, scrape planning, comparative re-analysis.
 - **Validator agent** — Filters scraped content (company, filing type, freshness, relevance).
 
-**Deterministic modules** — PDF extraction, section extraction, chunking, embeddings, Chroma storage, scraper execution.
+**Deterministic modules** — PDF extraction, section extraction, chunking, embeddings, Qdrant storage, scraper execution.
 
 ## Project structure
+
+## Docker
+
+Embedding runs on a **separate machine** — set `EMBEDDING_SERVICE_URL` in `.env` to that host (e.g. ngrok URL). The compose file only runs **backend + frontend**.
+
+```bash
+cp .env.docker.example .env
+# Edit .env — remote EMBEDDING_SERVICE_URL, Qdrant, LLM keys
+
+docker compose build
+docker compose up
+```
+
+Optional **local** embedding (only if not using a remote host):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.embedding.yml --profile embedding up
+```
+
+| Service | Host port | Image |
+|---------|-----------|--------|
+| Frontend | 3000 | `aegis-frontend:latest` |
+| Backend API | 8000 | `aegis-backend:latest` |
+
+## Deploy to Render
+
+1. Push the repo to GitHub (`render.yaml` defines two Docker web services).
+2. In [Render Blueprints](https://dashboard.render.com/select-repo?type=blueprint), connect the repo and apply the blueprint.
+3. In the Render dashboard, set secret env vars from `render.env.example` (especially `EMBEDDING_SERVICE_URL` pointing at your remote embedding host).
+4. After deploy: open **aegis-web** URL; the API is **aegis-api** (`RENDER_EXTERNAL_URL` is wired into the frontend build).
+
+Authorize the **Render MCP** plugin in Cursor to create or update services from the agent (`list_workspaces` → select workspace → `create_web_service` with `runtime: docker`).
 
 ## Split deployment (AWS + embedding host)
 

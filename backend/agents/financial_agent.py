@@ -18,7 +18,7 @@ from backend.agents.slm_system_prompts import (
     user_query_reminder,
 )
 from backend.extraction.section_models import FilingSection
-from backend.tools.chroma_tool import chromadb_manager
+from backend.tools.vector_store import vector_store as chromadb_manager
 from backend.tools.scrape_plan import (
     build_heuristic_scrape_requests,
     normalize_scraping_decision,
@@ -34,7 +34,7 @@ class FinancialAgent:
         company_name: str,
         n_results: int = 4,
     ) -> str:
-        """ChromaDB retrieval tool for agent reasoning (RAG-augmented analysis)."""
+        """Qdrant retrieval tool for agent reasoning (RAG-augmented analysis)."""
         where_filter = {"company": company_name} if company_name else None
         chunks = chromadb_manager.query_similar_chunks(
             query, n_results=n_results, where=where_filter
@@ -128,7 +128,7 @@ class FinancialAgent:
 
         [Uploaded company] {company_name}
 
-        [Retrieved RAG Context from vector_db / ChromaDB]
+        [Retrieved RAG Context from vector_db / Qdrant]
         {rag_context if rag_context else "No additional vector-retrieved chunks yet (first-pass ingestion)."}
 
         [Filing Text]

@@ -8,7 +8,7 @@ from backend.rag.citation_sources import (
     citation_from_chroma_chunk,
     summarize_source_types,
 )
-from backend.tools.chroma_tool import chromadb_manager
+from backend.tools.vector_store import vector_store as chromadb_manager
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ def generate_heuristic_rag_answer(query: str, chunks: list) -> dict:
 class RAGChatbot:
     def query_chatbot(self, user_question: str, company_name: str = None) -> dict:
         """
-        Retrieves top relevant chunks from ChromaDB and uses Qwen (or Heuristic RAG)
+        Retrieves top relevant chunks from Qdrant and uses Qwen (or Heuristic RAG)
         to answer with precise inline citations, avoiding hallucinations.
         """
         input_guard = guardrails.check_chat_message(user_question)
@@ -120,7 +120,7 @@ class RAGChatbot:
             # Try a broader search across all companies
             chunks = chromadb_manager.query_similar_chunks(user_question, n_results=4)
             
-        logger.info(f"Retrieved {len(chunks)} relevant chunks from ChromaDB.")
+        logger.info(f"Retrieved {len(chunks)} relevant chunks from Qdrant.")
 
         # Formulate context block
         context_parts = []

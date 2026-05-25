@@ -60,7 +60,7 @@ def configure_logging(level: int = logging.INFO) -> None:
         "sentence_transformers",
         "transformers",
         "watchfiles",
-        "chromadb",
+        "qdrant_client",
         "urllib3",
     ):
         logging.getLogger(noisy).setLevel(logging.WARNING)

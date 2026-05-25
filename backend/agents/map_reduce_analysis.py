@@ -18,7 +18,7 @@ from backend.agents.llm_client import llm_client
 from backend.config import get_settings
 from backend.extraction.section_models import FilingSection
 from backend.rag.chunking import split_text_into_chunks
-from backend.tools.chroma_tool import chromadb_manager
+from backend.tools.vector_store import vector_store as chromadb_manager
 from backend.tools.scrape_plan import build_heuristic_scrape_requests, normalize_scraping_decision
 
 logger = logging.getLogger(__name__)

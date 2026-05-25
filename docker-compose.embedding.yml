@@ -1,0 +1,55 @@
+# Optional local embedding stack — only if you are NOT using a remote embedding host.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.embedding.yml --profile embedding up
+
+services:
+  embedding:
+    profiles: [embedding]
+    build:
+      context: ./embedding-server
+      dockerfile: Dockerfile
+    image: aegis-embedding-server:latest
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      QDRANT_URL: ${QDRANT_URL:-}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
+      PRELOAD_MODEL: ${PRELOAD_MODEL:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - huggingface_cache:/cache/huggingface
+      - st_cache:/cache/sentence-transformers
+    expose:
+      - "8080"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  embedding-nginx:
+    profiles: [embedding]
+    image: nginx:1.27-alpine
+    ports:
+      - "${EMBEDDING_NGINX_PORT:-8088}:80"
+    volumes:
+      - ./embedding-server/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      embedding:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  huggingface_cache:
+  st_cache:
