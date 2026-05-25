@@ -456,7 +456,13 @@ export default function Home() {
             finish(resolve);
           } else if (d.status === "failed") {
             setProcessingStatus("failed");
-            finish(() => reject(new Error("Pipeline failed")));
+            const critical = [...(d.logs || [])]
+              .reverse()
+              .find((line: string) => /CRITICAL ERROR/i.test(line));
+            const detail = critical
+              ? critical.replace(/^CRITICAL ERROR:\s*/i, "").trim()
+              : "Pipeline failed";
+            finish(() => reject(new Error(detail)));
           } else {
             setProcessingStatus("processing");
           }

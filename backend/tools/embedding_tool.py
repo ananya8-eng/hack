@@ -120,6 +120,12 @@ def _post_json(
     response = requests.post(url, json=body, headers=headers, timeout=timeout)
     if response.status_code >= 400:
         detail = response.text[:500]
+        try:
+            err_json = response.json()
+            if isinstance(err_json, dict) and err_json.get("detail") is not None:
+                detail = str(err_json["detail"])[:500]
+        except ValueError:
+            pass
         raise RuntimeError(
             f"Embedding service returned {response.status_code}: {detail}"
         )
@@ -427,16 +433,17 @@ class EmbeddingManager:
             self.use_remote = True
             self.use_fallback = False
             self.remote_base_url = _normalize_service_url(settings.embedding_service_url)
+            # Embeddings are created only via POST /embed (service writes to Qdrant).
+            # Ignore vectors/auto modes that would batch-fetch vectors from /embed.
             resolved_mode = mode
-            if mode == "auto":
-                resolved_mode = self._detect_remote_mode(
-                    self.remote_base_url,
-                    _normalize_embed_path(settings.embedding_service_path),
-                    settings.embedding_service_api_key,
-                    settings.embedding_service_timeout,
-                    settings.embedding_body_format,
-                )
+            if mode in ("auto", "vectors", "vector", "remote"):
+                resolved_mode = "qdrant"
             self.use_qdrant_remote = resolved_mode in ("qdrant", "qdrant_store", "store")
+            if not self.use_qdrant_remote:
+                raise RuntimeError(
+                    f"Unsupported EMBEDDING_SERVICE_MODE={mode!r}. "
+                    "Use qdrant or leave auto when EMBEDDING_SERVICE_URL is set."
+                )
             self.remote_embed_path = _normalize_embed_path(
                 settings.embedding_service_path
             )
@@ -501,31 +508,9 @@ class EmbeddingManager:
             )
 
         if self.use_remote:
-            try:
-                vectors = _fetch_remote_embeddings(
-                    texts,
-                    base_url=self.remote_base_url,
-                    embed_path=self.remote_embed_path,
-                    body_format=self.remote_body_format,
-                    api_key=self.remote_api_key,
-                    timeout=self.remote_timeout,
-                    metadata_list=[{} for _ in texts],
-                )
-                logger.debug(
-                    "Fetched %s embedding(s) from %s%s",
-                    len(vectors),
-                    self.remote_base_url,
-                    self.remote_embed_path,
-                )
-                return vectors
-            except Exception as e:
-                logger.error(
-                    "Remote embedding request failed (%s%s): %s",
-                    self.remote_base_url,
-                    self.remote_embed_path,
-                    e,
-                )
-                raise
+            raise RuntimeError(
+                "Vector batch fetch is disabled. Index with upsert_chunks (POST /embed) only."
+            )
 
         if self.use_fallback:
             return [get_mock_embedding(t) for t in texts]
@@ -547,7 +532,6 @@ class EmbeddingManager:
 
         if self.use_qdrant_remote:
             point_ids: list[str] = []
-            vectors: list[list[float]] = []
             for chunk, meta, chunk_id in zip(chunks, metadata_list, ids):
                 payload_meta = {**meta, "chunk_id": chunk_id}
                 url = _service_url(self.remote_base_url, self.remote_embed_path)
@@ -558,17 +542,18 @@ class EmbeddingManager:
                     body={"text": chunk, "metadata": payload_meta},
                     timeout=self.remote_timeout,
                 )
-                if _is_qdrant_upsert_response(payload):
-                    point_ids.append(str(payload["id"]))
-                else:
-                    point_ids.append(chunk_id)
-                try:
-                    vectors.append(
-                        _vectors_from_payload(payload, expected_count=1)[0]
+                if not _is_qdrant_upsert_response(payload):
+                    raise RuntimeError(
+                        f"POST {self.remote_embed_path} must return "
+                        "{{success, id, embedding_size}}; got keys {sorted(payload.keys())}"
                     )
-                except RuntimeError:
-                    vectors.append(get_mock_embedding(chunk))
-            register_local_chunks(chunks, metadata_list, ids, vectors)
+                point_ids.append(str(payload["id"]))
+            logger.debug(
+                "Upserted %s chunk(s) via %s%s",
+                len(point_ids),
+                self.remote_base_url,
+                self.remote_embed_path,
+            )
             return point_ids
 
         if self.use_fallback:
@@ -605,17 +590,10 @@ class EmbeddingManager:
                     metadata_filter=flat_where,
                 )
             except Exception as exc:
-                logger.warning(
-                    "Qdrant direct search failed (%s); falling back to local cache.",
-                    exc,
-                )
-                return _search_local_cache(
-                    get_mock_embedding(query_text),
-                    limit=n_results,
-                    metadata_filter=flat_where,
-                )
+                logger.error("Qdrant search failed after /query embed: %s", exc)
+                raise
 
-        raise RuntimeError("search_chunks requires EMBEDDING_SERVICE_MODE=qdrant")
+        raise RuntimeError("search_chunks requires EMBEDDING_SERVICE_URL and qdrant mode")
 
 
 # Singleton helper

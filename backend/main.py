@@ -30,14 +30,9 @@ async def health_check():
         "service": "aegis-financial-api",
         "guardrails_enabled": settings.guardrails_enabled,
         "embeddings": (
-            "qdrant-remote"
-            if settings.embedding_service_url
-            and settings.embedding_service_mode in ("qdrant", "qdrant_store", "store")
-            else (
-                "remote"
-                if settings.embedding_service_url
-                else ("mock" if settings.use_mock_embeddings else "unset")
-            )
+            "embed-only"
+            if settings.embedding_service_url.strip()
+            else ("mock" if settings.use_mock_embeddings else "unset")
         ),
     }
 

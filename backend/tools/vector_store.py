@@ -9,11 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from backend.tools.embedding_tool import (
-    embedding_manager,
-    get_mock_embedding,
-    register_local_chunks,
-)
+from backend.tools.embedding_tool import embedding_manager, get_mock_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -84,19 +80,18 @@ class QdrantVectorStore:
     def __init__(self) -> None:
         self._cache: list[dict[str, Any]] = []
         embedding_manager.initialize()
-        self._use_qdrant = embedding_manager.uses_qdrant_remote()
-        if self._use_qdrant:
+        self._use_embed_service = embedding_manager.uses_qdrant_remote()
+        if self._use_embed_service:
             logger.info(
-                "Vector store: embed via embedding service, search via Qdrant Cloud."
+                "Vector store: index via POST /embed only; search via /query + Qdrant."
             )
         elif embedding_manager.use_remote:
-            logger.warning(
-                "Embedding service is in vectors mode (not qdrant). "
-                "Set EMBEDDING_SERVICE_MODE=qdrant for Qdrant Cloud storage."
+            raise RuntimeError(
+                "EMBEDDING_SERVICE_URL is set but embed-only mode is not active."
             )
         else:
             logger.info(
-                "Vector store: in-memory only (set EMBEDDING_SERVICE_URL for Qdrant Cloud)."
+                "Vector store: in-memory mock only (set EMBEDDING_SERVICE_URL for /embed)."
             )
 
     def add_chunks(
@@ -108,7 +103,7 @@ class QdrantVectorStore:
         if not chunks:
             return
 
-        if self._use_qdrant:
+        if self._use_embed_service:
             point_ids = embedding_manager.upsert_chunks(chunks, metadata_list, ids)
             for i, chunk in enumerate(chunks):
                 doc_id = ids[i]
@@ -126,23 +121,24 @@ class QdrantVectorStore:
                     existing.update(row)
                 else:
                     self._cache.append(row)
-            logger.info("Upserted %s chunks to Qdrant Cloud.", len(chunks))
+            logger.info(
+                "Indexed %s chunks via embedding service /embed (Qdrant Cloud).",
+                len(chunks),
+            )
             return
 
-        if embedding_manager.use_remote:
-            embeddings = embedding_manager.get_embeddings(chunks)
-        else:
-            embeddings = [get_mock_embedding(c) for c in chunks]
-        register_local_chunks(chunks, metadata_list, ids, embeddings)
+        if not embedding_manager.use_fallback:
+            raise RuntimeError(
+                "EMBEDDING_SERVICE_URL is required. Set USE_MOCK_EMBEDDINGS=true for local-only dev."
+            )
 
         for i, chunk in enumerate(chunks):
             doc_id = ids[i]
             meta = metadata_list[i] if i < len(metadata_list) else {}
-            emb = embeddings[i] if i < len(embeddings) else []
             row = {
                 "id": doc_id,
                 "document": chunk,
-                "embedding": emb,
+                "embedding": get_mock_embedding(chunk),
                 "metadata": meta,
             }
             existing = next((r for r in self._cache if r["id"] == doc_id), None)
@@ -150,7 +146,7 @@ class QdrantVectorStore:
                 existing.update(row)
             else:
                 self._cache.append(row)
-        logger.info("Indexed %s chunks in local dev cache.", len(chunks))
+        logger.info("Indexed %s chunks in mock-only dev cache.", len(chunks))
 
     def query_similar_chunks(
         self,
@@ -160,37 +156,12 @@ class QdrantVectorStore:
     ) -> list[dict[str, Any]]:
         flat_where = _flatten_where(where)
 
-        if self._use_qdrant:
-            try:
-                results = embedding_manager.search_chunks(
-                    query_text,
-                    n_results=n_results,
-                    where=flat_where,
-                )
-                if results:
-                    return results
-            except Exception as exc:
-                logger.warning("Qdrant search failed: %s", exc)
-
-            return _search_in_memory(
+        if self._use_embed_service:
+            return embedding_manager.search_chunks(
                 query_text,
                 n_results=n_results,
-                flat_where=flat_where,
-                cache=self._cache,
+                where=flat_where,
             )
-
-        if embedding_manager.use_remote:
-            try:
-                query_emb = embedding_manager.get_embedding(query_text)
-                from backend.tools.embedding_tool import _search_local_cache
-
-                return _search_local_cache(
-                    query_emb,
-                    limit=n_results,
-                    metadata_filter=flat_where,
-                )
-            except Exception as exc:
-                logger.warning("Remote vector search failed: %s", exc)
 
         return _search_in_memory(
             query_text,

@@ -35,6 +35,9 @@
     },
     "deploy-on-aws": {
       "enabled": true
+    },
+    "render": {
+      "enabled": true
     }
   }
 }

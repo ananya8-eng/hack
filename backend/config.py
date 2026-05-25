@@ -144,7 +144,7 @@ def get_settings() -> Settings:
         gemini_api_key=gemini_key,
         gemini_model=_env("GEMINI_MODEL", "gemini-2.0-flash"),
         llm_default_timeout=_env_int("LLM_DEFAULT_TIMEOUT", 90),
-        use_mock_embeddings=_env_bool("USE_MOCK_EMBEDDINGS", True),
+        use_mock_embeddings=_env_bool("USE_MOCK_EMBEDDINGS", False),
         embedding_model=_env("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         embedding_service_mode=_env("EMBEDDING_SERVICE_MODE", "qdrant").lower(),
         embedding_service_url=_env("EMBEDDING_SERVICE_URL", ""),
