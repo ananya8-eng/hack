@@ -2,7 +2,9 @@ from backend.tools.scrape_plan import (
     build_heuristic_scrape_requests,
     companies_from_requests,
     extract_peer_companies,
+    is_chat_comparison_query,
     is_comparison_query,
+    is_plausible_peer_name,
     normalize_scraping_decision,
     targets_to_requests,
 )
@@ -65,6 +67,23 @@ def test_companies_from_requests_includes_target():
 def test_is_comparison_query_detects_peer_language():
     assert is_comparison_query("Compare NVIDIA against AMD on supply chain", "")
     assert not is_comparison_query("What are the top three risks?", "")
+
+
+def test_is_chat_comparison_query_requires_explicit_compare_language():
+    assert is_chat_comparison_query("Compare NVIDIA against AMD on supply chain")
+    assert not is_chat_comparison_query("What are Apple's main smartphone competitors?")
+    assert not is_chat_comparison_query("What is Google's top 5 competitors?")
+    assert not is_chat_comparison_query("Is the company performing good?")
+    # Filing boilerplate must not force chat into comparison mode
+    filing = "We face competition and historical trends in our peer market share."
+    assert not is_chat_comparison_query("Is the company performing good?")
+    assert is_comparison_query("Is the company performing good?", filing)
+
+
+def test_is_plausible_peer_name_rejects_mda_jargon():
+    assert not is_plausible_peer_name("The Md&A", "Apple")
+    assert not is_plausible_peer_name("MD&A", "Apple")
+    assert is_plausible_peer_name("Samsung", "Apple")
 
 
 def test_extract_peer_companies_from_natural_language():

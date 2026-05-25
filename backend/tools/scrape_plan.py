@@ -21,16 +21,80 @@ COMPARE_KEYWORDS = (
     "market share",
 )
 
+_EXPLICIT_CHAT_COMPARE_RE = re.compile(
+    r"\b("
+    r"compare|comparison|compared\s+to|versus|vs\.?|"
+    r"against|benchmark(?:ing)?|relative\s+to|"
+    r"peer\s+(?:comparison|benchmark|vs\.?|versus)"
+    r")\b",
+    re.I,
+)
+
+_INVALID_PEER_NORMALIZED = frozenset(
+    {
+        "mda",
+        "themda",
+        "item7",
+        "item1a",
+        "item2",
+        "section",
+        "management",
+        "discussion",
+        "analysis",
+        "operations",
+        "results",
+        "company",
+        "the",
+        "main",
+        "smartphone",
+        "top",
+    }
+)
+
 
 def _needs_external_context(user_query: str, text: str) -> bool:
+    """Pipeline ingest: external enrichment when the user query or filing suggests it."""
     query_lower = (user_query or "").lower()
     text_lower = (text or "").lower()
     return any(w in query_lower or w in text_lower for w in COMPARE_KEYWORDS)
 
 
+def is_chat_comparison_query(user_query: str) -> bool:
+    """
+    Narrow gate for /api/chat comparative SLM (scrape + benchmark synthesis).
+
+    Requires explicit comparison language in the *user message* only.
+    Questions like "who are the competitors?" or "is performance good?" stay on RAG.
+    """
+    q = (user_query or "").strip()
+    if not q:
+        return False
+    if _EXPLICIT_CHAT_COMPARE_RE.search(q):
+        return True
+    peers = extract_peer_companies(q, "")
+    if peers and re.search(
+        r"\b(compare|versus|vs\.?|against|benchmark|relative|compared)\b", q, re.I
+    ):
+        return True
+    return False
+
+
 def is_comparison_query(user_query: str, filing_text: str = "") -> bool:
-    """True when the user message should trigger peer scrape + comparative SLM."""
+    """Pipeline-level comparison / external enrichment (query + filing excerpt)."""
     return _needs_external_context(user_query, filing_text)
+
+
+def is_plausible_peer_name(name: str, base_company: str = "") -> bool:
+    """Reject filing jargon (MD&A, Item 7) mistaken for company names."""
+    norm = re.sub(r"[^a-z0-9]", "", (name or "").lower())
+    base_norm = re.sub(r"[^a-z0-9]", "", (base_company or "").lower())
+    if not norm or len(norm) < 2 or (base_norm and norm == base_norm):
+        return False
+    if norm in _INVALID_PEER_NORMALIZED:
+        return False
+    if re.search(r"\bmd&?a\b", name or "", re.I):
+        return False
+    return True
 
 
 def extract_peer_companies(user_query: str, base_company: str) -> List[str]:
@@ -71,7 +135,12 @@ def extract_peer_companies(user_query: str, base_company: str) -> List[str]:
                 if len(name) < 2:
                     continue
                 norm = re.sub(r"[^a-z0-9]", "", name.lower())
-                if not norm or norm == base_norm or norm in seen:
+                if (
+                    not norm
+                    or norm == base_norm
+                    or norm in seen
+                    or not is_plausible_peer_name(name, base_company)
+                ):
                     continue
                 seen.add(norm)
                 peers.append(name.title())
@@ -227,42 +296,40 @@ def plan_comparison_scrapes(
             "targets": [],
         }
 
-    prompt = f"""
-[System] You plan external data fetches to answer ONE user comparison question about an SEC filing.
+    from backend.agents.slm_system_prompts import (
+        SlmRole,
+        compose_slm_prompt,
+        user_query_reminder,
+    )
 
-[Uploaded company]
-{company_name}
+    task_body = f"""
+    {user_query_reminder(query)}
 
-[User question]
-{query}
+    [Uploaded company] {company_name}
 
-[Filing excerpt]
-{(filing_excerpt or "")[:2500]}
+    [Filing excerpt — uploaded_filing / vector_db]
+    {(filing_excerpt or "")[:2500]}
 
-[Rules]
-- Only request sources needed to answer THIS question.
-- Do NOT assume or inject competitor names unless the user or filing excerpt names them.
-- Prefer web_search using the user's exact comparison intent as the query when discovery is needed.
-- Use sec_filing only for companies explicitly named in the user question (resolve to tickers in scrape_requests).
-- Use prior_filing only when the user asks for year-over-year / prior period on {company_name}.
-- Maximum 5 scrape_requests.
-
-Return strict JSON:
-{{
-  "needs_scraping": true,
-  "reason": "short reason",
-  "scrape_requests": [
+    [Task]
+    Plan the minimum tool calls (scrape_requests) needed to answer the user query only.
+    Return strict JSON:
     {{
-      "type": "web_search | sec_filing | prior_filing",
-      "query": "required for web_search — use the user's comparison wording",
-      "company": "ticker or company label",
-      "filing_type": "10-K | 10-Q | WEB",
-      "purpose": "why this fetch answers the question"
+      "needs_scraping": true,
+      "reason": "short reason tied to user query",
+      "scrape_requests": [
+        {{
+          "type": "web_search | sec_filing | prior_filing",
+          "query": "required for web_search — use the user's comparison wording",
+          "company": "valid SEC ticker or label",
+          "filing_type": "10-K | 10-Q | WEB",
+          "purpose": "why this fetch answers the user query"
+        }}
+      ],
+      "targets": []
     }}
-  ],
-  "targets": []
-}}
-"""
+  Maximum 5 scrape_requests. If the user query needs no external data, return needs_scraping=false and [].
+    """
+    prompt = compose_slm_prompt(SlmRole.SCRAPE_PLANNER, task_body)
 
     parsed = llm_client.generate_json(prompt, temperature=0.1, timeout=60)
     if isinstance(parsed, dict):

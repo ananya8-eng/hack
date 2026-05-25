@@ -17,6 +17,7 @@ from backend.extraction.heading_index import (
     build_heading_index,
     slice_sections_from_headings,
 )
+from backend.extraction.narrative_format import format_narrative_text
 from backend.extraction.section_models import FilingSection
 
 logger = logging.getLogger(__name__)
@@ -140,21 +141,20 @@ def _slice_by_anchors(
 
 
 def _llm_discover_outline(catalog: str, total_chars: int) -> Optional[List[Dict[str, Any]]]:
-    prompt = f"""
-[System] You are an SEC filing structure analyst for quarterly (10-Q) and annual (10-K) earnings reports.
+    from backend.agents.slm_system_prompts import SlmRole, compose_slm_prompt
 
-The hackathon focus is narrative text: especially Management's Discussion and Analysis (MD&A), risk factors,
-forward-looking statements, and other sections that reveal operational risks and sentiment — not raw financial tables.
+    task_body = f"""
+    [User query] Locate narrative sections in this filing for downstream risk/sentiment analysis.
 
-[Filing]
-Total length: {total_chars} characters.
-Below is a heading catalog (not the full body). Identify narrative sections present in THIS filing.
+    [Filing]
+    Total length: {total_chars} characters.
+    Below is a heading catalog (not the full body). Identify narrative sections present in THIS filing only.
 
-[Heading catalog]
-{catalog}
+    [Heading catalog]
+    {catalog}
 
-[Task]
-Return JSON only:
+    [Task]
+    Return JSON only:
 {{
   "filing_type_hint": "10-Q | 10-K | other",
   "sections": [
@@ -176,6 +176,7 @@ Rules:
 - Use anchors that appear verbatim in the catalog.
 - Sections must match THIS filing, not a generic template.
 """
+    prompt = compose_slm_prompt(SlmRole.SECTION_EXTRACTOR, task_body)
     parsed = llm_client.generate_json(prompt, temperature=0.0, timeout=120)
     if not isinstance(parsed, dict):
         return None
@@ -270,6 +271,17 @@ def discover_sections(full_text: str) -> List[FilingSection]:
         raise SectionExtractionError(
             "Could not extract usable narrative sections from this filing."
         )
+
+    sections = [
+        FilingSection(
+            id=s.id,
+            title=s.title,
+            text=format_narrative_text(s.text),
+            priority=s.priority,
+            source=s.source,
+        )
+        for s in sections
+    ]
 
     logger.info(
         "Section discovery complete: %s sections, %s chars (top: %s)",

@@ -55,6 +55,64 @@ def _flatten_where_for_memory(where: dict | None) -> dict:
     return {k: v for k, v in where.items() if k not in _CHROMA_OPERATORS and not isinstance(v, dict)}
 
 
+def _metadata_matches_where(metadata: dict | None, flat_where: dict) -> bool:
+    if not flat_where:
+        return True
+    metadata = metadata or {}
+    return all(metadata.get(k) == v for k, v in flat_where.items())
+
+
+def _format_chroma_query_results(chroma_results: dict | None) -> list[dict]:
+    formatted_results: list[dict] = []
+    if not chroma_results or not chroma_results.get("documents"):
+        return formatted_results
+
+    docs = chroma_results["documents"][0]
+    metas = chroma_results["metadatas"][0] if chroma_results.get("metadatas") else [{}] * len(docs)
+    ids = chroma_results["ids"][0] if chroma_results.get("ids") else [""] * len(docs)
+    distances = chroma_results["distances"][0] if chroma_results.get("distances") else [0.0] * len(docs)
+
+    for i in range(len(docs)):
+        score = 1.0 / (1.0 + distances[i])
+        formatted_results.append(
+            {
+                "document": docs[i],
+                "metadata": metas[i],
+                "score": score,
+                "id": ids[i],
+            }
+        )
+    return formatted_results
+
+
+def _chroma_where_strategies(flat_where: dict) -> list[tuple[dict | None, dict]]:
+    """
+    Build ordered (chroma_where, post_filter) strategies.
+
+    Chroma 1.5.x can raise "Error finding id" for some metadata filters (notably
+  company-only and certain section values). Post-filter in Python when needed.
+    """
+    if not flat_where:
+        return [(None, {})]
+
+    # company-only filters are unreliable in Chroma; vector search + post-filter.
+    if set(flat_where.keys()) == {"company"}:
+        return [(None, flat_where)]
+
+    strategies: list[tuple[dict | None, dict]] = [
+        (_normalize_where_for_chroma(flat_where), {}),
+    ]
+
+    if "section" in flat_where:
+        section_only = {"section": flat_where["section"]}
+        post = {k: v for k, v in flat_where.items() if k != "section"}
+        if post:
+            strategies.append((section_only, post))
+
+    strategies.append((None, flat_where))
+    return strategies
+
+
 class ChromaDBManager:
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or get_settings().chroma_db_path
@@ -171,40 +229,43 @@ class ChromaDBManager:
             results.sort(key=lambda x: x["score"], reverse=True)
             return results[:n_results]
 
-        try:
-            normalized_where = _normalize_where_for_chroma(where)
-            query_params = {
-                "query_embeddings": [query_emb],
-                "n_results": n_results
-            }
-            if normalized_where:
-                query_params["where"] = normalized_where
+        flat_where = _flatten_where_for_memory(where)
+        fetch_n = n_results if not flat_where else min(50, max(n_results * 8, 20))
 
-            chroma_results = self.collection.query(**query_params)
-            
-            formatted_results = []
-            if chroma_results and chroma_results.get("documents"):
-                docs = chroma_results["documents"][0]
-                metas = chroma_results["metadatas"][0] if chroma_results.get("metadatas") else [{}] * len(docs)
-                ids = chroma_results["ids"][0] if chroma_results.get("ids") else [""] * len(docs)
-                distances = chroma_results["distances"][0] if chroma_results.get("distances") else [0.0] * len(docs)
-                
-                for i in range(len(docs)):
-                    # ChromaDB returns L2 distance. Convert it to a similarity score format
-                    # lower distance means higher similarity.
-                    score = 1.0 / (1.0 + distances[i])
-                    formatted_results.append({
-                        "document": docs[i],
-                        "metadata": metas[i],
-                        "score": score,
-                        "id": ids[i]
-                    })
-            return formatted_results
+        for chroma_where, post_filter in _chroma_where_strategies(flat_where):
+            try:
+                query_params: dict = {
+                    "query_embeddings": [query_emb],
+                    "n_results": fetch_n,
+                }
+                if chroma_where:
+                    query_params["where"] = chroma_where
 
-        except Exception as e:
-            logger.error(f"Error querying ChromaDB: {str(e)}. Falling back to in-memory db.")
-            self.use_fallback = True
-            return self.query_similar_chunks(query_text, n_results, where)
+                chroma_results = self.collection.query(**query_params)
+                formatted_results = _format_chroma_query_results(chroma_results)
+
+                if post_filter:
+                    formatted_results = [
+                        row
+                        for row in formatted_results
+                        if _metadata_matches_where(row.get("metadata"), post_filter)
+                    ]
+
+                if formatted_results or not flat_where:
+                    return formatted_results[:n_results]
+            except Exception as e:
+                logger.warning(
+                    "ChromaDB query strategy failed (where=%s): %s",
+                    chroma_where,
+                    e,
+                )
+
+        logger.error(
+            "ChromaDB query returned no results for filters %s; "
+            "persistent store is still in use (not switching to empty in-memory fallback).",
+            flat_where,
+        )
+        return []
 
 # Singleton helper
 chromadb_manager = ChromaDBManager()

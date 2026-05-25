@@ -7,7 +7,16 @@ from backend.agents.analysis_heuristics import (
     comparative_analysis_from_contexts,
     compute_sentiment_heuristics,
 )
+from backend.rag.citation_sources import (
+    build_evidence_corpus,
+    sanitize_competitor_benchmarks,
+)
 from backend.agents.llm_client import llm_client
+from backend.agents.slm_system_prompts import (
+    SlmRole,
+    compose_slm_prompt,
+    user_query_reminder,
+)
 from backend.extraction.section_models import FilingSection
 from backend.tools.chroma_tool import chromadb_manager
 from backend.tools.scrape_plan import (
@@ -114,18 +123,17 @@ class FinancialAgent:
         rag_query = user_query if user_query else "operational risks supply chain competition regulatory"
         rag_context = self._retrieve_rag_context(rag_query, company_name)
 
-        # Formulate Qwen Prompt
-        prompt = f"""
-        [System] You are an elite AI Financial Intelligence Analyst specializing in SEC filings (10-K/10-Q).
-        Analyze the following text from {company_name}'s filing.
-        User Specific Request: {user_query if user_query else "Conduct a full comprehensive risk and sentiment audit."}
-        
-        [Retrieved RAG Context from ChromaDB]
+        task_body = f"""
+        {user_query_reminder(user_query, "Conduct a full comprehensive risk and sentiment audit.")}
+
+        [Uploaded company] {company_name}
+
+        [Retrieved RAG Context from vector_db / ChromaDB]
         {rag_context if rag_context else "No additional vector-retrieved chunks yet (first-pass ingestion)."}
-        
+
         [Filing Text]
         {text[:4000]}
-        
+
         [Task]
         Return a strict JSON document representing your financial analysis. Ensure the keys match exactly:
         {{
@@ -172,6 +180,7 @@ class FinancialAgent:
         - You may include multiple requests (web discovery first, then sec_filing for named peers).
         - Do not limit companies to a predefined set; choose companies and queries that match the user request and filing.
         """
+        prompt = compose_slm_prompt(SlmRole.FILING_ANALYST, task_body)
 
         parsed = llm_client.generate_json(prompt, temperature=0.1, timeout=90)
 
@@ -216,8 +225,7 @@ class FinancialAgent:
             f"The computed sentiment score ({sentiment_data['score']}) is highly correlated with "
             f"the frequency of cautionary statements and supply dependencies. In particular, {company_cleaned}'s exposure to "
             f"{risks_data[0]['category'] if risks_data else 'Operational'} vulnerabilities acts as a severe drag on margin ratings. "
-            f"If advanced packaging or global foundry allocation experiences a 10% capacity drop, the associated "
-            f"implication will directly compress gross margins by an estimated 150-300 basis points due to underutilization penalties."
+            f"Supply-chain or foundry constraints discussed in the filing may compress gross margins if capacity tightens."
         )
 
         return {
@@ -254,26 +262,24 @@ class FinancialAgent:
 
         scraped_text_block = "\n".join(scraped_summaries)
 
-        prompt = f"""
-        [System] You are an elite AI Financial Intelligence Analyst performing comparative benchmarking.
-        Answer ONLY from the original analysis and validated external contexts below.
-        Do NOT invent metrics, companies, or figures not supported by the provided text.
+        task_body = f"""
+        {user_query_reminder(question, "General peer benchmark requested.")}
 
-        [User comparison question]
-        {question or "General peer benchmark requested."}
+        [Uploaded company] {company_name}
 
-        [Uploaded company]
-        {company_name}
-
-        [Original Analysis]
+        [Original Analysis — from uploaded filing pipeline]
         {json.dumps(original_analysis, indent=2)}
 
-        [Validated External Contexts]
+        [Validated External Contexts — sec_edgar / web_search / prior_filing tools only]
         {scraped_text_block}
 
         [Task]
-        Perform a cross-comparison that directly addresses the user question.
-        Use competitor names ONLY as they appear in the contexts or the user question.
+        Perform a cross-comparison that directly answers the user query only.
+        Open comparative_analysis with a direct answer to the user's question in the first 1-2 sentences.
+        Use competitor names ONLY as they appear in the contexts or the user query.
+        NEVER set competitor_company to the same entity as {company_name} (no self-comparisons).
+        Do NOT invent revenue, net income, gross margin, or quarterly figures unless the exact numbers appear above.
+        Prefer qualitative, excerpt-backed benchmarks over fabricated financial tables.
         Return strict JSON with these keys:
         {{
             "original_summary": "Brief summary of original analysis",
@@ -296,6 +302,7 @@ class FinancialAgent:
             "explainability_synthesis": "How these factors affect operational risk per the evidence"
         }}
         """
+        prompt = compose_slm_prompt(SlmRole.COMPARATIVE, task_body)
 
         def _valid_comparative(payload: dict) -> bool:
             return isinstance(payload.get("comparative_analysis"), str)
@@ -308,7 +315,16 @@ class FinancialAgent:
         )
         if parsed:
             logger.info("Model returned parseable JSON for comparative analysis")
-            return parsed
+            corpus = build_evidence_corpus(
+                original_analysis,
+                scraped_contexts,
+            )
+            benchmarks = sanitize_competitor_benchmarks(
+                parsed.get("competitor_benchmarks") or [],
+                company_name,
+                corpus,
+            )
+            return {**parsed, "competitor_benchmarks": benchmarks}
 
         logger.warning(
             "Comparative LLM did not return valid JSON after retries; using evidence-only fallback"

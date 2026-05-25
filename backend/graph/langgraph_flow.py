@@ -27,7 +27,9 @@ from backend.rag.chunking import split_text_into_chunks
 from backend.tools.chroma_tool import chromadb_manager
 from backend.tools.scrape_plan import companies_from_requests, resolve_request_tickers
 from backend.tools.scraper import financial_scraper
+from backend.extraction.margin_trends import compute_margin_trends
 from backend.reports_store import append_report_log
+from backend.tools.scrape_plan import extract_peer_companies
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,7 @@ class AgentState(TypedDict, total=False):
     scraped_documents: List[Dict[str, Any]]
     validated_contexts: List[Dict[str, Any]]
     final_comparative_analysis: Dict[str, Any]
+    margin_trends: Dict[str, Any]
 
     current_step: str
     logs: List[str]
@@ -399,14 +402,51 @@ def node_comparative_reanalysis(state: AgentState) -> Dict[str, Any]:
             if not msg.startswith("[Self-heal]"):
                 logs.append(f"[Self-heal] {msg}")
 
+    peer = _resolve_peer_company(state)
+    margin_trends = _build_margin_trends(state)
+    if margin_trends.get("points"):
+        peer_suffix = f" vs {margin_trends.get('peer_label')}" if peer else ""
+        logs.append(
+            f"Margin trend series built ({len(margin_trends['points'])} year(s)) "
+            f"from SEC filings{peer_suffix}."
+        )
+    else:
+        logs.append("Margin trend series unavailable — no gross margin figures found in SEC excerpts.")
+
     logs.append("Comparative re-analysis complete — benchmarks and tone shifts synthesized.")
     logs.append("LangGraph Financial Intelligence pipeline executed successfully.")
 
     return {
         "final_comparative_analysis": comp_result,
+        "margin_trends": margin_trends,
         "current_step": "Pipeline Completed",
         "logs": logs,
     }
+
+
+def _resolve_peer_company(state: AgentState) -> str | None:
+    company = str(state.get("company_name") or "").strip()
+    if not company:
+        return None
+
+    for ctx in state.get("validated_contexts") or []:
+        label = str(ctx.get("company") or "").strip()
+        if not label or label.upper() in {"EXTERNAL", "WEB"}:
+            continue
+        if label.upper() != company.upper():
+            return label
+
+    peers = extract_peer_companies(str(state.get("user_query") or ""), company)
+    return peers[0] if peers else None
+
+
+def _build_margin_trends(state: AgentState) -> Dict[str, Any]:
+    peer = _resolve_peer_company(state)
+    return compute_margin_trends(
+        str(state.get("company_name") or "Target Company"),
+        peer_company=peer,
+        uploaded_text=str(state.get("raw_text") or ""),
+    )
 
 
 def _build_finalize_analysis(original_analysis: Dict[str, Any], company_name: str) -> Dict[str, Any]:
@@ -434,11 +474,18 @@ def node_finalize_without_scrape(state: AgentState) -> Dict[str, Any]:
     company = state.get("company_name", "Target Company")
     final = _build_finalize_analysis(orig_analysis, company)
 
+    margin_trends = _build_margin_trends(state)
+
     logs.append("Pipeline completed without external web enrichment.")
+    if margin_trends.get("points"):
+        logs.append(
+            f"Margin trend series built ({len(margin_trends['points'])} year(s)) from SEC filings."
+        )
     logs.append("LangGraph Financial Intelligence pipeline executed successfully.")
 
     return {
         "final_comparative_analysis": final,
+        "margin_trends": margin_trends,
         "current_step": "Pipeline Completed",
         "logs": logs,
     }

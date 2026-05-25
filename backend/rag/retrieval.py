@@ -3,6 +3,11 @@ import re
 
 from backend.agents.llm_client import llm_client
 from backend.guardrails import guardrails
+from backend.agents.slm_system_prompts import SlmRole, compose_slm_prompt, user_query_reminder
+from backend.rag.citation_sources import (
+    citation_from_chroma_chunk,
+    summarize_source_types,
+)
 from backend.tools.chroma_tool import chromadb_manager
 
 logger = logging.getLogger(__name__)
@@ -35,14 +40,13 @@ def generate_heuristic_rag_answer(query: str, chunks: list) -> dict:
                 matching_sentences.append(s.strip())
                 
         if matching_sentences:
-            citation_id = f"[{comp} {sec} - Chunk {chunk_idx}]"
-            citations.append({
-                "citation_id": citation_id,
-                "section": sec,
-                "company": comp,
-                "chunk_index": chunk_idx,
-                "content": doc[:300] + "..."
-            })
+            citations.append(
+                citation_from_chroma_chunk(
+                    {"document": doc, "metadata": meta},
+                    chunk_idx,
+                )
+            )
+            citation_id = citations[-1]["citation_id"]
             # Add top sentences as evidence
             evidence_sentences.append((matching_sentences[0], citation_id))
 
@@ -56,14 +60,10 @@ def generate_heuristic_rag_answer(query: str, chunks: list) -> dict:
             comp = meta.get("company", "Company")
             chunk_idx = meta.get("chunk_index", 0)
             
-            citation_id = f"[{comp} {sec} - Chunk {chunk_idx}]"
-            citations.append({
-                "citation_id": citation_id,
-                "section": sec,
-                "company": comp,
-                "chunk_index": chunk_idx,
-                "content": top_item.get("document")[:300] + "..."
-            })
+            citations.append(
+                citation_from_chroma_chunk(top_item, chunk_idx)
+            )
+            citation_id = citations[-1]["citation_id"]
             
             answer = (
                 f"Based on the retrieved {sec} section of {comp}, the filing discusses general operational conditions. "
@@ -89,7 +89,8 @@ def generate_heuristic_rag_answer(query: str, chunks: list) -> dict:
     return {
         "answer": answer,
         "citations": citations,
-        "success": True
+        "source_summary": summarize_source_types(citations),
+        "success": True,
     }
 
 class RAGChatbot:
@@ -136,24 +137,19 @@ class RAGChatbot:
             
         context_text = "\n".join(context_parts)
 
-        prompt = f"""
-        [System] You are an elite, citation-backed Financial RAG Chatbot. 
-        Your primary directive is to answer the user's question STRICTLY using the provided filing contexts.
-        
-        [Rules]
-        1. Answer ONLY using the facts from the context. Do NOT hallucinate.
-        2. Provide precise inline citations citing the sources in brackets, e.g., [NVIDIA Risk Factors - Chunk 4].
-        3. If the context does not contain enough information to answer, state clearly: "I cannot find sufficient evidence in the retrieved filings to answer this." Do not make up facts.
-        
-        [Retrieved Filing Contexts]
+        task_body = f"""
+        {user_query_reminder(user_question)}
+
+        [Retrieved Filing Contexts — uploaded_filing / vector_db only]
         {context_text}
-        
-        [User Question]
-        {user_question}
-        
+
         [Task]
-        Synthesize your comprehensive response with citations.
+        Answer the user query in prose with inline bracket citations for every factual claim.
+        If the contexts are insufficient, respond with exactly:
+        "I cannot find sufficient evidence in the retrieved filings to answer this."
+        Do not request tools; retrieval is already complete for this turn.
         """
+        prompt = compose_slm_prompt(SlmRole.RAG_CHAT, task_body)
 
         response_text = llm_client.generate(prompt, temperature=0.1, timeout=60)
 
@@ -176,26 +172,15 @@ class RAGChatbot:
         response_text = output_guard.sanitized_text or response_text
 
         if response_text and len(response_text.strip()) > 50:
-            # Build citations list for UI display
-            citations = []
-            for item in chunks:
-                meta = item.get("metadata", {})
-                sec = meta.get("section", "Section").replace("_", " ").title()
-                comp = meta.get("company", "Company")
-                chunk_idx = meta.get("chunk_index", 0)
-                
-                citations.append({
-                    "citation_id": f"[{comp} {sec} - Chunk {chunk_idx}]",
-                    "section": sec,
-                    "company": comp,
-                    "chunk_index": chunk_idx,
-                    "content": item.get("document")[:300] + "..."
-                })
-            
+            citations = [
+                citation_from_chroma_chunk(item, i) for i, item in enumerate(chunks)
+            ]
+
             return {
                 "answer": response_text.strip(),
                 "citations": citations,
-                "success": True
+                "source_summary": summarize_source_types(citations),
+                "success": True,
             }
 
         # ==========================================
@@ -210,6 +195,10 @@ class RAGChatbot:
             return payload
         if out_guard.sanitized_text:
             heuristic = {**heuristic, "answer": out_guard.sanitized_text}
+        if not heuristic.get("source_summary"):
+            heuristic["source_summary"] = summarize_source_types(
+                heuristic.get("citations") or []
+            )
         return heuristic
 
 # Singleton helper

@@ -1,682 +1,223 @@
-# AI-Powered Financial Intelligence Platform — Final Architecture Guide
+# Aegis — AI-Powered Financial Intelligence Platform
 
-## Project Overview
+An adaptive financial filing intelligence platform for **10-K / 10-Q PDFs**. Upload a filing, run a LangGraph pipeline for risk and sentiment analysis, optionally enrich with SEC EDGAR peer filings, and explore results in a Next.js dashboard with a citation-backed RAG chatbot.
 
-Build an AI-powered financial filing intelligence platform that:
+## What it does
 
-- Accepts uploaded financial filing PDFs
-- Extracts important narrative sections
-- Detects operational/business risks
-- Performs sentiment analysis
-- Uses AI agents with LangGraph
-- Dynamically decides when external web scraping is needed
-- Fetches competitor and previous filings
-- Validates scraped data
-- Generates comparative insights
-- Provides a RAG chatbot with citations
-- Displays insights in an interactive dashboard
+- **Upload & ingest** — PDF text extraction (PyMuPDF), narrative section discovery, chunking, and ChromaDB indexing (`BAAI/bge-large-en-v1.5` embeddings).
+- **Map-reduce analysis** — Financial intelligence agent analyzes sections in parallel, then synthesizes risks, severity, sentiment, and summaries.
+- **Agentic scraping** — When context is thin or the user asks for comparisons, the graph plans targets, fetches filings via `sec-edgar-downloader`, and validates sources before re-analysis.
+- **Comparative insights** — Cross-filing benchmarks, tone shifts, and peer comparisons grounded in retrieved text (no fabricated financial tables).
+- **RAG chat** — Ask questions about a completed report with chunk citations; comparison-style questions can trigger on-demand peer scraping.
+- **Guardrails** — Input/output checks for scope, length, and safe LLM responses on upload and chat.
 
----
-
-# Final Architecture
-
-```text
-User Uploads Filing PDF
-          ↓
-
-PDF Processing Pipeline
-(extract → sections → chunk → embeddings)
-          ↓
-
-Financial Intelligence Agent (Qwen)
-          ↓
-
-Agent decides:
-- Is more context needed?
-- Need previous filings?
-- Need competitor comparison?
-          ↓
-
-Web Scraping Tool
-          ↓
-
-Validator Agent
-          ↓
-
-Validated External Context
-          ↓
-
-Financial Intelligence Agent (Re-analysis)
-          ↓
-
-Dashboard + Chatbot
-```
-
----
-
-# Final Tech Stack
+## Tech stack
 
 | Layer | Technology |
-|---|---|
-| Frontend | Next.js |
-| Styling | Tailwind CSS |
-| Backend | FastAPI |
-| Agent Framework | LangGraph |
-<<<<<<< HEAD
-| Main AI Model | Qwen2.5 3B Instruct |
-| LLM Runtime | Ollam(locally running) -> nvdia->grok->huggingface->gemini (one serves as fallback when preceeding privider fails) |
-=======
-| Main AI Model | Qwen2.5 7B Instruct |
-| LLM Runtime | Ollama |
->>>>>>> e9f92d154254dc63c9b771aa7dc8357d06ea697f
-| Embeddings | BAAI/bge-large-en-v1.5 |
-| Vector Database | ChromaDB |
-| PDF Parsing | PyMuPDF |
-| Section Extraction | Regex + NLP |
-| Chunking | LangChain |
-| Sentiment Model | FinBERT |
-| Web Scraping | BeautifulSoup + sec-edgar-downloader |
-| Charts | Recharts |
-| Optional DB | PostgreSQL |
-
----
-
-# Final Agent Architecture
-
-## Agent 1 — Financial Intelligence Agent
-
-### Purpose
-Main reasoning agent.
-
-### Responsibilities
-
-- Risk analysis
-- Sentiment analysis
-- Severity scoring
-- Executive summaries
-- Comparative analysis
-- Deciding when scraping is required
-- Detecting missing context
-- Competitor identification
-- Historical trend analysis
-- Explainability generation
-
-### Uses
-
-- Qwen2.5 via Ollama
-- ChromaDB retrieval tool
-- Web scraping tool
-
----
-
-## Agent 2 — Validator Agent
-
-### Purpose
-Validate scraped data before using it.
-
-### Responsibilities
-
-- Validate company relevance
-- Validate filing type
-- Validate filing freshness
-- Reject irrelevant webpages
-- Reject outdated filings
-- Prevent noisy enrichment
-- Validate competitor relevance
-- Validate scraped context quality
-
-### Example Validation Rules
-
-Reject if:
-
-- source is not an official filing
-- filing is too old
-- unrelated company detected
-- duplicate content
-- suspicious webpage
-
----
-
-# What Is NOT An Agent
-
-These are deterministic backend modules.
-
-| Component | Type |
-|---|---|
-| PDF Extraction | Backend Module |
-| Section Extraction | Backend Module |
-| Chunking | Backend Module |
-| Embedding Generation | Backend Module |
-| ChromaDB Storage | Backend Module |
-| Web Scraping Execution | Tool |
-
----
-
-# Complete System Flow
-
-## STEP 1 — Upload Filing
-
-User uploads:
-
-```text
-10-K / 10-Q PDF
-```
-
----
-
-## STEP 2 — PDF Extraction
-
-### Tool
-PyMuPDF
-
-### Purpose
-Extract raw text from PDF.
-
-### Example
-
-```python
-import fitz
-
-pdf = fitz.open("report.pdf")
-text = ""
-
-for page in pdf:
-    text += page.get_text()
-```
-
----
-
-# STEP 3 — Narrative Section Extraction
-
-### Purpose
-Extract only important narrative sections.
-
-### Important Sections
-
-- Risk Factors
-- MD&A
-- Forward Looking Statements
-
-### Why?
-
-Avoid:
-
-- tables
-- balance sheets
-- irrelevant financial statements
-- repeated headers
-
-### Approach
-
-Use regex-based heading detection.
-
-### Example
-
-```python
-import re
-
-pattern = r"ITEM 1A\.(.*?)ITEM 2\."
-
-match = re.search(pattern, text, re.DOTALL)
-
-risk_section = match.group(1)
-```
-
----
-
-# STEP 4 — Chunking
-
-### Purpose
-Split large sections into smaller semantic chunks.
-
-### Recommended
-
-- Chunk size: 700
-- Overlap: 100
-
-### Tool
-LangChain RecursiveCharacterTextSplitter
-
-### Example
-
-```python
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=700,
-    chunk_overlap=100
-)
-
-chunks = splitter.split_text(risk_section)
-```
-
----
-
-# STEP 5 — Embeddings
-
-### Purpose
-Convert chunks into semantic vectors.
-
-### Embedding Model
-BAAI/bge-large-en-v1.5
-
-### Example
-
-```python
-from sentence_transformers import SentenceTransformer
-
-model = SentenceTransformer(
-    "BAAI/bge-large-en-v1.5"
-)
-
-embedding = model.encode(chunks[0])
-```
-
----
-
-# STEP 6 — Store In ChromaDB
-
-### Purpose
-Store semantic vectors for RAG retrieval.
-
-### Example
-
-```python
-import chromadb
-
-client = chromadb.PersistentClient(path="./db")
-
-collection = client.get_or_create_collection("filings")
-```
-
----
-
-# STEP 7 — Financial Intelligence Agent Analysis
-
-## Main Reasoning Phase
-
-Agent analyzes:
-
-- operational risks
-- sentiment
-- uncertainty
-- management tone
-- business concerns
-
-### Example Prompt
-
-```text
-Analyze this filing section.
-
-Return:
-- risks
-- severity
-- supporting evidence
-- sentiment
-- executive summary
-```
-
----
-
-# STEP 8 — Agent Decides Whether Scraping Is Needed
-
-## Core Agentic Behavior
-
-Agent determines:
-
-```text
-Do I already have enough context?
-```
-
----
-
-# Conditions That Trigger Scraping
-
-| Condition | Example |
-|---|---|
-| Missing context | vague risk description |
-| Historical comparison needed | previous year trend |
-| Competitor comparison needed | industry-wide issue |
-| Low confidence | insufficient evidence |
-| User asks comparison | compare with AMD |
-
----
-
-# Structured Decision Output
-
-```json
-{
-  "needs_scraping": true,
-  "reason": "Need competitor comparison",
-  "targets": [
-    "AMD latest filing",
-    "Intel latest filing"
-  ]
-}
-```
-
----
-
-# STEP 9 — Web Scraping Tool
-
-## Purpose
-Fetch contextual financial data.
-
-### Fetch:
-
-- previous filings
-- competitor filings
-- earnings reports
-- industry reports
-
----
-
-# Recommended Tools
-
-## SEC Filing Fetching
+|--------|------------|
+| Frontend | Next.js 16, React 19, Tailwind CSS 4, Recharts |
+| Backend | FastAPI, Uvicorn |
+| Orchestration | LangGraph |
+| LLM | Cloud APIs with fallback: **NVIDIA NIM → Grok → Hugging Face → Gemini** |
+| Embeddings | Remote service (`embedding-server/`) or mock vectors locally |
+| Vector DB | ChromaDB (persistent under `./chroma_db`) |
+| PDF | PyMuPDF |
+| SEC data | `sec-edgar-downloader` |
+
+> **Note:** Local Ollama is not used by the current `LLMClient`. Configure at least one cloud API key in `.env` (see below).
+
+## Prerequisites
+
+- **Python** 3.10+ (3.11 recommended)
+- **Node.js** 20+ and npm
+- **API keys** — at least one of: `NVIDIA_API_KEY`, `GROK_API_KEY` / `XAI_API_KEY`, `HUGGINGFACE_API_KEY` / `HF_TOKEN`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`
+- **SEC EDGAR** — `SEC_EDGAR_EMAIL` (required by SEC fair-access policy when downloading filings)
+- Disk space for ChromaDB on the API host; embedding model runs on a **separate host** (see `embedding-server/`) unless `USE_MOCK_EMBEDDINGS=true`
+
+## Quick start
+
+### 1. Clone and open the project
 
 ```bash
-pip install sec-edgar-downloader
+cd hack
 ```
 
-### Example
+All commands below assume your shell is in the repository root (`hack/`).
 
-```python
-from sec_edgar_downloader import Downloader
-
-loader = Downloader("filings")
-
-loader.get("10-K", "NVDA")
-```
-
----
-
-# HTML Scraping
-
-### Tool
-BeautifulSoup
-
-### Example
-
-```python
-import requests
-from bs4 import BeautifulSoup
-
-html = requests.get(url).text
-soup = BeautifulSoup(html, "html.parser")
-```
-
----
-
-# STEP 10 — Validator Agent
-
-## Purpose
-Validate scraped content.
-
-### Validator Checks
-
-- correct company
-- correct filing type
-- recent filing
-- trusted source
-- useful comparison
-
-### Example
-
-Reject:
-
-```text
-Random blog article
-```
-
-Accept:
-
-```text
-Official SEC 10-K filing
-```
-
----
-
-# STEP 11 — Financial Agent Re-analysis
-
-Agent now compares:
-
-- uploaded filing
-- previous filing
-- competitor filings
-
-### Example Insights
-
-```text
-NVIDIA mentions supply chain risks 18 times.
-AMD mentions them only 6 times.
-```
-
-```text
-Management tone became more cautious compared to previous year.
-```
-
----
-
-# STEP 12 — Dashboard
-
-## Dashboard Components
-
-### 1. Filing Viewer
-
-- highlighted risk words
-- clickable evidence
-- page navigation
-
----
-
-### 2. Risk Panel
-
-Display:
-
-- detected risks
-- severity levels
-- evidence
-
----
-
-### 3. Sentiment Panel
-
-Display:
-
-- sentiment score
-- positive/negative classification
-- tone trends
-
----
-
-### 4. Comparison Panel
-
-Display:
-
-- competitor comparisons
-- previous filing trends
-- risk evolution
-
----
-
-### 5. Chatbot Panel
-
-Display:
-
-- citation-backed answers
-- conversational querying
-
----
-
-# Chatbot Architecture
-
-## Flow
-
-```text
-User Question
-      ↓
-Embedding Generation
-      ↓
-ChromaDB Retrieval
-      ↓
-Relevant Chunks
-      ↓
-Qwen Response
-```
-
----
-
-# RAG Prompting Rules
-
-Always:
-
-- answer ONLY from retrieved context
-- provide citations
-- avoid hallucinations
-
----
-
-# Suggested Folder Structure
-
-```text
-backend/
- ├── agents/
- │    ├── financial_agent.py
- │    ├── validator_agent.py
- │
- ├── tools/
- │    ├── scraper.py
- │    ├── chroma_tool.py
- │    ├── embedding_tool.py
- │
- ├── ingestion/
- │    ├── pdf_extractor.py
- │
- ├── extraction/
- │    ├── section_extractor.py
- │
- ├── rag/
- │    ├── chunking.py
- │    ├── retrieval.py
- │
- ├── graph/
- │    ├── langgraph_flow.py
- │
- ├── api/
- │    ├── routes.py
- │
-frontend/
- ├── dashboard/
- ├── chatbot/
- ├── filing-viewer/
- ├── charts/
- └── components/
-```
-
----
-
-# Recommended Python Packages
+### 2. Backend setup
 
 ```bash
-pip install fastapi uvicorn
-pip install pymupdf
-pip install chromadb
-pip install sentence-transformers
-pip install langchain
-pip install langgraph
-pip install requests beautifulsoup4
-pip install sec-edgar-downloader
-pip install transformers
-pip install ollama
+python -m venv .venv
+
+# Windows (PowerShell)
+.\.venv\Scripts\Activate.ps1
+
+# macOS / Linux
+# source .venv/bin/activate
+
+pip install -r requirements.txt
 ```
 
----
-
-# Ollama Setup
-
-## Install
-
-https://ollama.com
-
----
-
-# Pull Qwen Model
+Create `.env` in the project root (copy from the template below). **Do not commit `.env`.**
 
 ```bash
-ollama pull qwen2.5:7b-instruct
+# Minimal example — set at least one LLM key and your SEC email
+NVIDIA_API_KEY=your_key_here
+SEC_EDGAR_EMAIL=you@example.com
+SEC_EDGAR_COMPANY_NAME=YourOrgName
+API_HOST=127.0.0.1
+API_PORT=8000
+CORS_ORIGINS=http://localhost:3000
 ```
 
----
-
-# Run Model
+Start the API:
 
 ```bash
-ollama run qwen2.5:7b-instruct
+python -m backend.main
 ```
 
----
+Or with Uvicorn directly:
 
-# Example Ollama API Call
-
-```python
-import requests
-
-response = requests.post(
-    "http://localhost:11434/api/generate",
-    json={
-        "model": "qwen2.5:7b-instruct",
-        "prompt": "Analyze financial risks",
-        "stream": False
-    }
-)
+```bash
+uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
----
+Verify: [http://127.0.0.1:8000/api/health](http://127.0.0.1:8000/api/health) → `{"status":"ok",...}`
 
-# Final Architecture Summary
+Interactive API docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
-## Agents
+### 3. Frontend setup
 
-| Agent | Purpose |
-|---|---|
-| Financial Intelligence Agent | reasoning + orchestration |
-| Validator Agent | trust + validation |
+```bash
+cd frontend
+cp .env.example .env.local
+npm install
+npm run dev
+```
 
----
+Open [http://localhost:3000](http://localhost:3000). The UI polls the backend while the LangGraph pipeline runs (default timeout 15 minutes — see `NEXT_PUBLIC_PIPELINE_POLL_TIMEOUT_MS`).
 
-## Tools
+### 4. Run a filing analysis
 
-| Tool | Purpose |
-|---|---|
-| PDF Extraction Tool | extract text |
-| Chunking Tool | split text |
-| Embedding Tool | generate embeddings |
-| ChromaDB Tool | semantic retrieval |
-| Web Scraping Tool | fetch external filings |
+1. Open the dashboard and upload a **PDF** (10-K or 10-Q).
+2. Optionally set **company name** and a **focus query** (e.g. “Compare supply chain risk with AMD”).
+3. Wait for status logs to reach `completed` (pipeline runs in the background after upload).
+4. Review risks, sentiment, comparisons, and use the chat panel on the report.
 
----
+Scraped SEC filings are stored under `./scraped_filings` (gitignored).
 
-# Final Key Insight
+## Environment variables
 
-The system is NOT:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `API_HOST` | `127.0.0.1` | FastAPI bind host |
+| `API_PORT` | `8000` | FastAPI port |
+| `CORS_ORIGINS` | `*` | Comma-separated origins for the Next.js app |
+| `NVIDIA_API_KEY` | — | Primary LLM (NVIDIA integrate API) |
+| `NVIDIA_MODEL` | `meta/llama-3.1-8b-instruct` | NVIDIA model id |
+| `GROK_API_KEY` / `XAI_API_KEY` | — | xAI Grok fallback |
+| `HUGGINGFACE_API_KEY` / `HF_TOKEN` | — | Hugging Face inference fallback |
+| `HUGGINGFACE_MODEL` | `Qwen/Qwen2.5-3B-Instruct` | HF model id |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | — | Google Gemini fallback |
+| `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model |
+| `LLM_DEFAULT_TIMEOUT` | `90` | Per-request LLM timeout (seconds) |
+| `EMBEDDING_SERVICE_URL` | — | Remote embedding API base (e.g. `http://embed-host:8088`) — **required for AWS** |
+| `EMBEDDING_SERVICE_API_KEY` | — | `X-API-Key` for the embedding nginx service |
+| `EMBEDDING_SERVICE_TIMEOUT` | `120` | HTTP timeout (seconds) for embedding batches |
+| `USE_MOCK_EMBEDDINGS` | `true` | Deterministic mock vectors (local dev; ignored if `EMBEDDING_SERVICE_URL` is set) |
+| `CHROMA_DB_PATH` | `./chroma_db` | Chroma persistence directory |
+| `PRELOAD_EMBEDDINGS_ON_STARTUP` | `false` | Warm up embedding client at startup |
+| `SEC_EDGAR_EMAIL` | — | **Required** for SEC downloads |
+| `SEC_EDGAR_COMPANY_NAME` | `AegisFinancialAgent` | SEC downloader user-agent identity |
+| `SCRAPED_FILINGS_DIR` | `./scraped_filings` | Local SEC filing cache |
+| `GUARDRAILS_ENABLED` | `true` | Enable guardrail checks |
+
+Frontend (`frontend/.env.local`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NEXT_PUBLIC_API_BASE_URL` | `http://127.0.0.1:8000` | Backend base URL |
+| `NEXT_PUBLIC_PIPELINE_POLL_TIMEOUT_MS` | `900000` | Max wait for pipeline (15 min) |
+
+## API endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/health` | Service health |
+| `POST` | `/api/upload` | Upload PDF (`file`), optional `company_name`, `user_query` |
+| `GET` | `/api/reports` | List reports |
+| `GET` | `/api/reports/{id}` | Full report + analysis result |
+| `GET` | `/api/reports/{id}/status` | Pipeline step + logs (for polling) |
+| `POST` | `/api/reports/trigger` | Re-run or extend analysis on an existing report |
+| `POST` | `/api/chat` | RAG / comparison chat (`report_id`, `message`) |
+
+## Pipeline flow (LangGraph)
 
 ```text
-simple PDF summarization
+Upload PDF
+    → discover sections → chunk & index (ChromaDB)
+    → map-reduce financial analysis
+    → [optional] scrape SEC / web → validate → comparative re-analysis
+    → finalize → dashboard + chat
 ```
 
-It becomes:
+**Agents**
+
+- **Financial intelligence agent** — Risk/sentiment analysis, scrape planning, comparative re-analysis.
+- **Validator agent** — Filters scraped content (company, filing type, freshness, relevance).
+
+**Deterministic modules** — PDF extraction, section extraction, chunking, embeddings, Chroma storage, scraper execution.
+
+## Project structure
+
+## Split deployment (AWS + embedding host)
+
+1. On a **dedicated machine** (office server, GPU box, etc.): run `embedding-server/` with Docker Compose (nginx on port **8088**). See `embedding-server/README.md`.
+2. On **EC2**: deploy FastAPI + frontend only; set `EMBEDDING_SERVICE_URL=http://<embedding-host>:8088` and matching `EMBEDDING_SERVICE_API_KEY`. Set `USE_MOCK_EMBEDDINGS=false`.
+3. Restrict security groups so only the EC2 instance can reach port 8088 on the embedding host.
 
 ```text
-Adaptive AI Financial Intelligence Platform
+hack/
+├── embedding-server/    # BGE model + nginx (separate machine)
+├── backend/
+│   ├── agents/          # financial_agent, validator, llm_client, map-reduce
+│   ├── graph/           # langgraph_flow.py
+│   ├── extraction/      # section discovery & models
+│   ├── ingestion/       # pdf_extractor
+│   ├── rag/             # chunking, retrieval, citations, chat comparison
+│   ├── tools/           # chroma, embeddings, scraper, scrape_plan
+│   ├── guardrails/
+│   ├── tests/
+│   ├── config.py
+│   └── main.py          # FastAPI app
+├── frontend/
+│   └── app/             # Next.js dashboard UI
+├── requirements.txt
+├── .env                 # local secrets (not in git)
+└── readMe.md
 ```
 
-because:
+## Tests
 
-- AI analyzes uploaded filings
-- AI decides when external enrichment is needed
-- AI fetches contextual filings dynamically
-- AI validates scraped data
-- AI performs comparative financial reasoning
-- AI generates explainable insights
+From the repo root with the venv active:
 
+```bash
+pip install pytest
+python -m pytest backend/tests -q
+```
+
+Tests cover guardrails, section extraction, LLM JSON/fallback, map-reduce, scraper planning, and embeddings/Chroma integration (mock embeddings where applicable).
+
+## Troubleshooting
+
+| Issue | What to check |
+|-------|----------------|
+| LLM errors / empty analysis | At least one API key in `.env`; watch backend logs for provider fallback order |
+| Slow indexing / empty vectors | `EMBEDDING_SERVICE_URL` reachable from EC2; embedding host `curl :8088/health`; API keys match |
+| SEC scrape failures | `SEC_EDGAR_EMAIL` set; network access; ticker/company name in upload metadata |
+| Frontend cannot reach API | `NEXT_PUBLIC_API_BASE_URL` matches `API_HOST`/`API_PORT`; `CORS_ORIGINS` includes `http://localhost:3000` |
+| Upload blocked | Guardrails — keep queries financial and within length limits |
+
+## License & attribution
+
+Built for the Financial Analysis Platform hackathon. SEC EDGAR data is subject to [SEC fair access](https://www.sec.gov/os/webmaster-faq#developers) requirements — use a valid contact email and reasonable request rates.

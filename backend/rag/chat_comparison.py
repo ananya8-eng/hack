@@ -10,10 +10,21 @@ from backend.guardrails import guardrails
 from backend.agents.healing_loop import run_comparative_with_healing, run_scrape_with_healing
 from backend.agents.validator_agent import validator_agent
 from backend.rag.chunking import split_text_into_chunks
+from backend.rag.citation_sources import (
+    build_evidence_corpus,
+    citation_from_chroma_chunk,
+    citation_from_scraped_context,
+    companies_match,
+    sanitize_competitor_benchmarks,
+    summarize_source_types,
+)
 from backend.tools.chroma_tool import chromadb_manager
+from backend.extraction.margin_trends import compute_margin_trends
 from backend.tools.scrape_plan import (
     companies_from_requests,
-    is_comparison_query,
+    extract_peer_companies,
+    is_chat_comparison_query,
+    is_plausible_peer_name,
     plan_comparison_scrapes,
     resolve_request_tickers,
 )
@@ -45,6 +56,44 @@ def _filing_excerpt(report: dict, limit: int = 3000) -> str:
     return str(result.get("raw_text") or "")[:limit]
 
 
+def _filter_peer_contexts(
+    contexts: List[dict],
+    target_company: str,
+) -> List[dict]:
+    """Drop SEC pulls for the same issuer (common cause of 'Apple vs Apple' benchmarks)."""
+    target_ticker = financial_scraper.resolve_ticker(target_company)
+    kept: List[dict] = []
+    for ctx in contexts:
+        filing_type = str(ctx.get("filing_type") or "").upper()
+        if "PRIOR" in filing_type:
+            kept.append(ctx)
+            continue
+        peer = str(ctx.get("company") or "")
+        if not is_plausible_peer_name(peer, target_company):
+            logger.info("Skipping non-peer scrape context label: %s", peer)
+            continue
+        peer_ticker = financial_scraper.resolve_ticker(peer)
+        if peer_ticker and target_ticker and peer_ticker == target_ticker:
+            logger.info(
+                "Skipping duplicate target-company scrape context: %s", peer
+            )
+            continue
+        if companies_match(peer, target_company):
+            continue
+        kept.append(ctx)
+    return kept
+
+
+def _filing_vector_citations(user_message: str, company_name: str, limit: int = 4) -> List[dict]:
+    where_filter = {"company": company_name} if company_name else None
+    chunks = chromadb_manager.query_similar_chunks(
+        user_message, n_results=limit, where=where_filter
+    )
+    if not chunks and company_name:
+        chunks = chromadb_manager.query_similar_chunks(user_message, n_results=limit)
+    return [citation_from_chroma_chunk(item, i) for i, item in enumerate(chunks)]
+
+
 def _format_comparison_answer(comp: dict, company_name: str) -> str:
     parts: List[str] = []
     narrative = str(comp.get("comparative_analysis") or "").strip()
@@ -53,12 +102,17 @@ def _format_comparison_answer(comp: dict, company_name: str) -> str:
 
     benchmarks = comp.get("competitor_benchmarks") or []
     if benchmarks:
-        parts.append("\n\n**Metric benchmarks**")
+        parts.append("\n\n**Metric benchmarks** *(from retrieved filing + scrape evidence only)*")
         for bm in benchmarks[:6]:
             metric = bm.get("metric_name", "Metric")
-            peer = bm.get("competitor_company", "Peer")
-            value = bm.get("comparison_value", "")
-            parts.append(f"- {metric} ({company_name} vs {peer}): {value}")
+            peer = bm.get("competitor_company") or bm.get("comparison_target") or "Peer"
+            value = str(bm.get("comparison_value") or "").strip()
+            if companies_match(str(peer), company_name):
+                continue
+            if value:
+                parts.append(f"- **{metric}** ({company_name} vs {peer}): {value}")
+            else:
+                parts.append(f"- **{metric}** ({company_name} vs {peer})")
 
     tone_shifts = comp.get("tone_shifts") or []
     if tone_shifts:
@@ -73,27 +127,24 @@ def _format_comparison_answer(comp: dict, company_name: str) -> str:
     if synthesis:
         parts.append(f"\n\n**Risk synthesis:** {synthesis}")
 
+    if benchmarks:
+        parts.append(
+            "\n\n*Benchmark rows without supporting numbers in the retrieved "
+            "filing or scrape text are omitted automatically.*"
+        )
+
     return "\n".join(parts).strip() or (
         f"Comparison for {company_name} completed, but the model returned no narrative text."
     )
 
 
-def _comparison_citations(validated_contexts: List[dict]) -> List[dict]:
-    citations: List[dict] = []
+def _comparison_citations(
+    validated_contexts: List[dict],
+    filing_citations: List[dict],
+) -> List[dict]:
+    citations: List[dict] = list(filing_citations)
     for i, ctx in enumerate(validated_contexts):
-        company = ctx.get("company", "Peer")
-        source = ctx.get("source", "External filing")
-        text = str(ctx.get("text") or "")
-        citations.append(
-            {
-                "citation_id": f"[{company} — scraped peer context]",
-                "section": "Peer benchmark",
-                "company": company,
-                "chunk_index": i,
-                "content": text[:300] + ("..." if len(text) > 300 else ""),
-                "source": source,
-            }
-        )
+        citations.append(citation_from_scraped_context(ctx, i))
     return citations
 
 
@@ -109,7 +160,7 @@ def run_chat_peer_comparison(
     company = report.get("company_name", "Target Company")
     filing_text = _filing_excerpt(report, limit=8000)
 
-    if not is_comparison_query(user_message, filing_text):
+    if not is_chat_comparison_query(user_message):
         return {"handled": False}
 
     input_guard = guardrails.check_chat_message(user_message)
@@ -126,6 +177,8 @@ def run_chat_peer_comparison(
         if on_progress:
             on_progress(msg)
 
+    filing_citations = _filing_vector_citations(user_message, company)
+
     progress("Comparison intent detected — planning live scrape targets from your question...")
     scrape_decision = plan_comparison_scrapes(user_message, company, filing_text)
     scrape_requests = list(scrape_decision.get("scrape_requests") or [])
@@ -137,9 +190,10 @@ def run_chat_peer_comparison(
             "answer": (
                 "I understood this as a peer comparison request, but need a clearer target. "
                 f"Name the company or period to benchmark against {company} "
-                "(for example: \"Compare against [ticker] on supply chain and gross margins\")."
+                '(for example: "Compare against MSFT on supply chain and gross margins").'
             ),
-            "citations": [],
+            "citations": filing_citations,
+            "source_summary": summarize_source_types(filing_citations),
             "comparison": None,
             "status_steps": [
                 scrape_decision.get("reason")
@@ -170,6 +224,7 @@ def run_chat_peer_comparison(
     status_steps: List[str] = [
         f"Scrape plan: {len(scrape_requests)} request(s).",
         f"Retrieved {len(scraped_docs)} document(s) before validation.",
+        f"Uploaded filing chunks in vector DB: {len(filing_citations)} citation(s).",
     ]
 
     for doc in scraped_docs:
@@ -185,6 +240,7 @@ def run_chat_peer_comparison(
                     "company": doc_company,
                     "filing_type": doc.get("filing_type"),
                     "text": audit.get("cleaned_content") or doc.get("text", ""),
+                    "urls": doc.get("urls") or [],
                 }
             )
             chunks = split_text_into_chunks(
@@ -214,17 +270,21 @@ def run_chat_peer_comparison(
         label = req.get("query") or req.get("company") or "unknown"
         status_steps.append(f"Scrape failure: {label}")
 
+    validated_contexts = _filter_peer_contexts(validated_contexts, company)
+
     if not validated_contexts:
         return {
             "handled": True,
             "success": False,
             "mode": "comparison",
             "answer": (
-                "I attempted to fetch peer filing data for your comparison, but no sources "
-                "passed validation. Name a specific public company or filing period in your "
-                "question, or check that SEC/network access is available."
+                f"I could not retrieve validated peer filing or web data for your comparison "
+                f"against {company}. Name a specific US public company and metric "
+                f'(e.g. "Compare {company} vs MSFT on gross margins and supply chain risks"), '
+                "or check that SEC/network access is available."
             ),
-            "citations": [],
+            "citations": filing_citations,
+            "source_summary": summarize_source_types(filing_citations),
             "comparison": None,
             "status_steps": status_steps,
         }
@@ -242,15 +302,59 @@ def run_chat_peer_comparison(
 
     comp_result, heal_logs = run_comparative_with_healing(_compare)
     status_steps.extend(heal_logs)
+
+    corpus = build_evidence_corpus(original_analysis, validated_contexts, filing_text)
+    comp_result = {
+        **comp_result,
+        "competitor_benchmarks": sanitize_competitor_benchmarks(
+            comp_result.get("competitor_benchmarks") or [],
+            company,
+            corpus,
+        ),
+    }
     status_steps.append("Comparative analysis complete.")
 
+    peer: Optional[str] = None
+    for ctx in validated_contexts:
+        label = str(ctx.get("company") or "").strip()
+        if label and not companies_match(label, company):
+            peer = label
+            break
+    if not peer:
+        peers = [
+            p
+            for p in extract_peer_companies(user_message, company)
+            if is_plausible_peer_name(p, company)
+        ]
+        peer = peers[0] if peers else None
+
+    margin_trends = compute_margin_trends(
+        company,
+        peer_company=peer,
+        uploaded_text=filing_text,
+    )
+    if margin_trends.get("points"):
+        status_steps.append(
+            f"Margin trend series updated ({len(margin_trends['points'])} year(s) from SEC)."
+        )
+
+    stored = report.get("result")
+    if isinstance(stored, dict):
+        report["result"] = {
+            **stored,
+            "final_comparative_analysis": comp_result,
+            "margin_trends": margin_trends,
+        }
+
+    all_citations = _comparison_citations(validated_contexts, filing_citations)
     answer = _format_comparison_answer(comp_result, company)
     return {
         "handled": True,
         "success": True,
         "mode": "comparison",
         "answer": answer,
-        "citations": _comparison_citations(validated_contexts),
+        "citations": all_citations,
+        "source_summary": summarize_source_types(all_citations),
         "comparison": comp_result,
         "status_steps": status_steps,
     }

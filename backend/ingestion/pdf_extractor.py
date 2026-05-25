@@ -5,6 +5,38 @@ from typing import List, Tuple
 logger = logging.getLogger(__name__)
 
 
+def _page_text_from_blocks(page) -> str:
+    """
+    Rebuild page text from layout blocks so table cells on the same row stay together.
+    """
+    try:
+        blocks = page.get_text("blocks") or []
+    except Exception:
+        return ""
+    if not blocks:
+        return ""
+
+    row_buckets: dict[int, list[tuple[float, str]]] = {}
+    for block in blocks:
+        if len(block) < 7 or block[6] != 0:
+            continue
+        x0, y0, _x1, _y1, text = block[0], block[1], block[2], block[3], block[4]
+        chunk = (text or "").strip()
+        if not chunk:
+            continue
+        y_key = int(y0 // 3)
+        row_buckets.setdefault(y_key, []).append((float(x0), chunk))
+
+    if not row_buckets:
+        return ""
+
+    lines: List[str] = []
+    for y_key in sorted(row_buckets.keys()):
+        parts = [t for _x, t in sorted(row_buckets[y_key], key=lambda item: item[0])]
+        lines.append("  ".join(parts))
+    return "\n".join(lines)
+
+
 def extract_pdf_text(pdf_path_or_bytes) -> str:
     """
     Extract all text from a PDF with page markers for section discovery on large filings.
@@ -37,7 +69,7 @@ def extract_pdf_pages(pdf_path_or_bytes) -> List[Tuple[int, str]]:
 
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            page_text = page.get_text() or ""
+            page_text = _page_text_from_blocks(page) or page.get_text() or ""
             pages.append((page_num + 1, page_text))
         doc.close()
         logger.info("Extracted %s pages from PDF", len(pages))

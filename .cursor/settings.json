@@ -32,6 +32,9 @@
     },
     "firebase": {
       "enabled": true
+    },
+    "deploy-on-aws": {
+      "enabled": true
     }
   }
 }

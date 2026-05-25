@@ -5,8 +5,10 @@ from backend.rag.chat_comparison import run_chat_peer_comparison
 
 def test_non_comparison_query_not_handled():
     report = {"company_name": "NVIDIA", "result": {"sections": {"risk": "competition"}}}
-    out = run_chat_peer_comparison(report, "What is the biggest operational risk?")
+    out = run_chat_peer_comparison(report, "What are NVIDIA's main competitors?")
     assert out.get("handled") is False
+    out2 = run_chat_peer_comparison(report, "What is the biggest operational risk?")
+    assert out2.get("handled") is False
 
 
 @patch("backend.rag.chat_comparison.run_comparative_with_healing")

@@ -45,45 +45,36 @@ def revise_scrape_requests(
     """
     LLM revises scrape_requests after tool failures (e.g. invalid ticker APPLE → AAPL).
     """
-    prompt = f"""
-[System] You are a financial data orchestration agent that repairs failed scrape plans.
+    from backend.agents.slm_system_prompts import (
+        SlmRole,
+        compose_slm_prompt,
+        user_query_reminder,
+    )
 
-[Context]
-Primary company (uploaded filing): {company_name}
-User request: {user_query or "General financial intelligence analysis"}
-Heal attempt: {attempt} of {_max_attempts()}
+    task_body = f"""
+    {user_query_reminder(user_query, "General financial intelligence analysis")}
 
-[Original scrape_requests]
-{json.dumps(original_requests, indent=2)}
+    [Uploaded company] {company_name}
+    [Heal attempt] {attempt} of {_max_attempts()}
 
-[Tool failures — read carefully and fix root causes]
-{_failure_summary(failures)}
+    [Original scrape_requests]
+    {json.dumps(original_requests, indent=2)}
 
-[Filing excerpt for grounding]
-{(filing_excerpt or "")[:2000]}
+    [Tool failures — fix root causes only]
+    {_failure_summary(failures)}
 
-[Rules]
-- For sec_filing and prior_filing, "company" MUST be a valid SEC ticker (e.g. AAPL not APPLE, GOOGL not GOOGLE).
-- Resolve brand names to tickers: Apple → AAPL, Microsoft → MSFT, Amazon → AMZN, Alphabet/Google → GOOGL, Meta/Facebook → META.
-- web_search requests need a concrete natural-language "query"; company can be a label.
-- Do not repeat requests that already failed without correcting the underlying issue.
-- Prefer web_search first for competitor discovery, then sec_filing with correct tickers.
+    [Filing excerpt]
+    {(filing_excerpt or "")[:2000]}
 
-[Task]
-Return JSON only:
-{{
-  "reasoning": "Brief explanation of what went wrong and how you fixed it",
-  "scrape_requests": [
+    [Task]
+    Return JSON only with revised scrape_requests that can succeed on retry.
+    Do not add fetches unrelated to the user query.
     {{
-      "type": "web_search | sec_filing | prior_filing",
-      "query": "for web_search only",
-      "company": "valid SEC ticker or descriptive label for web_search",
-      "filing_type": "10-K | 10-Q | WEB",
-      "purpose": "why this fetch helps"
+      "reasoning": "what failed and how you fixed it",
+      "scrape_requests": [{{ "type", "query", "company", "filing_type", "purpose" }}]
     }}
-  ]
-}}
-"""
+    """
+    prompt = compose_slm_prompt(SlmRole.SCRAPE_HEALER, task_body)
     parsed = llm_client.generate_json(prompt, temperature=0.0, timeout=90)
     if not parsed:
         logger.warning("Heal scrape plan: LLM did not return JSON on attempt %s", attempt)
@@ -118,26 +109,33 @@ def revise_financial_analysis(
     """
     LLM re-runs or patches financial analysis when validation finds gaps.
     """
-    prompt = f"""
-[System] You are an elite financial analyst repairing an incomplete or inconsistent analysis.
+    from backend.agents.slm_system_prompts import (
+        SlmRole,
+        compose_slm_prompt,
+        user_query_reminder,
+    )
 
-[Company] {company_name}
-[User request] {user_query or "Full risk and sentiment audit"}
+    task_body = f"""
+    {user_query_reminder(user_query, "Full risk and sentiment audit")}
 
-[Issues to fix]
-{chr(10).join(f"- {issue}" for issue in issues)}
+    [Company] {company_name}
 
-[Previous analysis]
-{json.dumps(previous_analysis, indent=2)[:6000]}
+    [Issues to fix]
+    {chr(10).join(f"- {issue}" for issue in issues)}
 
-[Filing text]
-{filing_text[:4000]}
+    [Previous analysis]
+    {json.dumps(previous_analysis, indent=2)[:6000]}
 
-[Task]
-Return the same JSON schema as a full financial analysis (risks, sentiment, executive_summary,
-explainability, needs_scraping, reason, scrape_requests). Fix all listed issues.
-Use valid SEC tickers in scrape_requests (AAPL not APPLE).
-"""
+    [Filing text]
+    {filing_text[:4000]}
+
+    [Task]
+    Return the same JSON schema as a full financial analysis (risks, sentiment, executive_summary,
+    explainability, needs_scraping, reason, scrape_requests). Fix all listed issues only.
+    Use valid SEC tickers in scrape_requests (AAPL not APPLE). Do not add scrape_requests unless
+    required to satisfy the user query.
+    """
+    prompt = compose_slm_prompt(SlmRole.ANALYSIS_HEALER, task_body)
     parsed = llm_client.generate_json(prompt, temperature=0.1, timeout=90)
     if parsed:
         logger.info("Financial analysis healed on attempt %s", attempt)

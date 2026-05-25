@@ -70,6 +70,9 @@ class Settings:
     # Embeddings & vector store
     use_mock_embeddings: bool
     embedding_model: str
+    embedding_service_url: str
+    embedding_service_api_key: str
+    embedding_service_timeout: int
     chroma_db_path: str
     preload_embeddings_on_startup: bool
     max_chunks_per_section: int
@@ -77,6 +80,7 @@ class Settings:
     map_analysis_chunk_chars: int
     max_map_passes: int
     max_heal_attempts: int
+    chat_max_agent_steps: int
 
     # Guardrails
     guardrails_enabled: bool
@@ -130,15 +134,19 @@ def get_settings() -> Settings:
         gemini_api_key=gemini_key,
         gemini_model=_env("GEMINI_MODEL", "gemini-2.0-flash"),
         llm_default_timeout=_env_int("LLM_DEFAULT_TIMEOUT", 90),
-        use_mock_embeddings=_env_bool("USE_MOCK_EMBEDDINGS", False),
+        use_mock_embeddings=_env_bool("USE_MOCK_EMBEDDINGS", True),
         embedding_model=_env("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5"),
+        embedding_service_url=_env("EMBEDDING_SERVICE_URL", ""),
+        embedding_service_api_key=_env("EMBEDDING_SERVICE_API_KEY", ""),
+        embedding_service_timeout=_env_int("EMBEDDING_SERVICE_TIMEOUT", 120),
         chroma_db_path=_env("CHROMA_DB_PATH", "./chroma_db"),
-        preload_embeddings_on_startup=_env_bool("PRELOAD_EMBEDDINGS_ON_STARTUP", True),
+        preload_embeddings_on_startup=_env_bool("PRELOAD_EMBEDDINGS_ON_STARTUP", False),
         max_chunks_per_section=_env_int("MAX_CHUNKS_PER_SECTION", 80),
         max_chunks_per_filing=_env_int("MAX_CHUNKS_PER_FILING", 250),
         map_analysis_chunk_chars=_env_int("MAP_ANALYSIS_CHUNK_CHARS", 3500),
         max_map_passes=_env_int("MAX_MAP_PASSES", 24),
         max_heal_attempts=_env_int("MAX_HEAL_ATTEMPTS", 3),
+        chat_max_agent_steps=_env_int("CHAT_MAX_AGENT_STEPS", 8),
         guardrails_enabled=_env_bool("GUARDRAILS_ENABLED", True),
         guardrails_require_financial_scope=_env_bool(
             "GUARDRAILS_REQUIRE_FINANCIAL_SCOPE", True

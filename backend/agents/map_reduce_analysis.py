@@ -66,24 +66,27 @@ def map_analyze_chunk(
     rag_query = user_query or "operational risks supply chain MD&A outlook sentiment"
     rag_ctx = _retrieve_section_context(rag_query, company_name, section.id)
 
-    prompt = f"""
-[System] You analyze narrative text from a public company earnings filing (10-Q/10-K).
-Focus: operational risks, supply chain, regulatory issues, management tone, and forward challenges
-that are NOT visible from balance-sheet numbers alone.
+    from backend.agents.slm_system_prompts import (
+        SlmRole,
+        compose_slm_prompt,
+        user_query_reminder,
+    )
 
-[Company] {company_name}
-[Section] {section.title} (id={section.id}, priority={section.priority})
-[Chunk] {chunk_index + 1} of {chunk_total}
-[User focus] {user_query or "Earnings report risk and sentiment extraction"}
+    task_body = f"""
+    {user_query_reminder(user_query, "Earnings report risk and sentiment extraction")}
 
-[Vector context]
-{rag_ctx or "None"}
+    [Company] {company_name}
+    [Section] {section.title} (id={section.id}, priority={section.priority})
+    [Chunk] {chunk_index + 1} of {chunk_total}
 
-[Narrative excerpt]
-{chunk_text}
+    [Vector context — uploaded_filing / vector_db]
+    {rag_ctx or "None"}
 
-[Task]
-Return JSON only:
+    [Narrative excerpt — uploaded filing only]
+    {chunk_text}
+
+    [Task]
+    Return JSON only:
 {{
   "section_id": "{section.id}",
   "section_title": "{section.title}",
@@ -108,6 +111,7 @@ Return JSON only:
   "mda_highlights": ["key MD&A insight if this section is MD&A-related, else empty list"]
 }}
 """
+    prompt = compose_slm_prompt(SlmRole.MAP_REDUCE_SECTION, task_body)
     parsed = llm_client.generate_json(prompt, temperature=0.1, timeout=75)
     if parsed:
         return parsed
@@ -289,25 +293,31 @@ def reduce_partials(
         indent=2,
     )[:5000]
 
-    prompt = f"""
-[System] You synthesize a hackathon-grade earnings narrative intelligence report.
-Topic: Risk & Sentiment Extractor — surface hidden operational risks and negative tone shifts in MD&A
-and related narrative, not raw financial statement tables.
+    from backend.agents.slm_system_prompts import (
+        SlmRole,
+        compose_slm_prompt,
+        user_query_reminder,
+    )
 
-[Company] {company_name}
-[User request] {user_query or "Extract risks, sentiment shifts, and future challenges from quarterly filing narrative."}
+    task_body = f"""
+    {user_query_reminder(
+        user_query,
+        "Extract risks, sentiment shifts, and future challenges from quarterly filing narrative.",
+    )}
 
-[Discovered sections in this filing]
-{json.dumps(section_summary, indent=2)}
+    [Company] {company_name}
 
-[Map-reduce digest from all section chunks]
-{map_digest}
+    [Discovered sections in this filing]
+    {json.dumps(section_summary, indent=2)}
 
-[MD&A / narrative excerpt sample]
-{combined_excerpt[:5000]}
+    [Map-reduce digest from all section chunks — prior map pass only]
+    {map_digest}
 
-[Task]
-Return JSON only. The risks array MUST use exactly this object shape — do not invent alternative keys:
+    [MD&A / narrative excerpt sample]
+    {combined_excerpt[:5000]}
+
+    [Task]
+    Return JSON only. The risks array MUST use exactly this object shape — do not invent alternative keys:
 {{
   "risks": [
     {{
@@ -329,7 +339,9 @@ Return JSON only. The risks array MUST use exactly this object shape — do not 
   "scrape_requests": [...],
   "targets": []
 }}
-"""
+    Set needs_scraping and scrape_requests only if the user query requires external tools.
+    """
+    prompt = compose_slm_prompt(SlmRole.MAP_REDUCE_REDUCE, task_body)
     parsed = llm_client.generate_json(prompt, temperature=0.1, timeout=120)
     if parsed:
         normalized_parsed_risks = _normalize_risk_list(parsed.get("risks"))

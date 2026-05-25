@@ -1,6 +1,17 @@
 import os
+import sys
+from types import ModuleType
 from unittest.mock import MagicMock, mock_open, patch
+
 from backend.tools.scraper import FinancialScraper
+
+
+def _sec_edgar_patch():
+    """Stub sec_edgar_downloader so tests run without the optional package installed."""
+    stub = ModuleType("sec_edgar_downloader")
+    mock_cls = MagicMock()
+    stub.Downloader = mock_cls
+    return patch.dict(sys.modules, {"sec_edgar_downloader": stub}), mock_cls
 
 
 @patch("backend.tools.scraper.requests.get")
@@ -8,7 +19,8 @@ def test_fetch_sec_filing_normal(mock_requests_get):
     scraper = FinancialScraper(download_dir="fake_download_dir")
     scraper.resolve_ticker = MagicMock(return_value="AAPL")
 
-    with patch("sec_edgar_downloader.Downloader") as mock_downloader_cls, \
+    sec_patch, mock_downloader_cls = _sec_edgar_patch()
+    with sec_patch, \
          patch("os.path.isdir", return_value=True), \
          patch("os.listdir") as mock_listdir, \
          patch("os.walk") as mock_walk, \
@@ -54,7 +66,8 @@ def test_fetch_sec_filing_prior_generic(mock_requests_get):
     scraper = FinancialScraper(download_dir="fake_download_dir")
     scraper.resolve_ticker = MagicMock(return_value="AAPL")
 
-    with patch("sec_edgar_downloader.Downloader") as mock_downloader_cls, \
+    sec_patch, mock_downloader_cls = _sec_edgar_patch()
+    with sec_patch, \
          patch("os.path.isdir", return_value=True), \
          patch("os.listdir") as mock_listdir, \
          patch("os.walk") as mock_walk, \
@@ -93,6 +106,28 @@ def test_fetch_sec_filing_prior_generic(mock_requests_get):
         assert "Prior year filing content text" in result["text"]
         assert result["company"] == "AAPL"
         assert result["filing_type"] == "10-Q-PRIOR"
+
+
+@patch("backend.tools.scraper.requests.post")
+def test_web_search_returns_lite_snippets(mock_post):
+    html = """
+    <html><body>
+    <a class="result-link" href="https://example.com/competitors">Apple Competitors</a>
+    <td class="result-snippet">Apple competes with Samsung and Google in smartphones worldwide.</td>
+    </body></html>
+    """
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.text = html
+    mock_resp.raise_for_status = MagicMock()
+    mock_post.return_value = mock_resp
+
+    scraper = FinancialScraper(download_dir="fake_download_dir")
+    result = scraper.web_search("Apple smartphone competitors", company="Apple")
+
+    assert result["success"] is True
+    assert "Samsung" in result["text"]
+    assert len(result["text"]) >= 100
 
 
 def test_execute_scrape_request_prior_propagates_correctly():

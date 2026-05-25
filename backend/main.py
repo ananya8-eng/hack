@@ -12,10 +12,9 @@ from backend.ingestion.pdf_extractor import extract_pdf_text
 from backend.tools.embedding_tool import embedding_manager
 from backend.logging_config import configure_logging
 from backend.guardrails import guardrails
-from backend.rag.chat_comparison import run_chat_peer_comparison
-from backend.rag.retrieval import rag_chatbot
-from backend.tools.scrape_plan import is_comparison_query
+from backend.rag.chat_agent import run_chat_agent
 from backend.reports_store import REPORTS_DB, append_report_log
+from backend.tools.scraper import financial_scraper
 
 configure_logging()
 logger = logging.getLogger("backend.main")
@@ -30,6 +29,11 @@ async def health_check():
         "status": "ok",
         "service": "aegis-financial-api",
         "guardrails_enabled": settings.guardrails_enabled,
+        "embeddings": (
+            "remote"
+            if settings.embedding_service_url
+            else ("mock" if settings.use_mock_embeddings else "unset")
+        ),
     }
 
 
@@ -38,8 +42,13 @@ def _configure_runtime_logging() -> None:
     """Re-apply filters after uvicorn attaches access log handlers."""
     configure_logging()
     if settings.preload_embeddings_on_startup:
-        logger.info("Preloading embedding model at startup...")
+        logger.info("Initializing embedding client at startup...")
         embedding_manager.initialize()
+    elif settings.embedding_service_url:
+        logger.info(
+            "Remote embedding service configured (%s); skipping local preload.",
+            settings.embedding_service_url.rstrip("/"),
+        )
 
 
 # Enable CORS for frontend connection (Next.js)
@@ -170,6 +179,7 @@ def run_agent_pipeline_task(
             "scrape_requests": original_analysis.get("scrape_requests", []),
             "scraping_reason": final_state.get("scraping_reason", ""),
             "final_comparative_analysis": final_comparative,
+            "margin_trends": final_state.get("margin_trends", {}),
         }
 
         REPORTS_DB[report_id]["status"] = "complete"
@@ -219,6 +229,64 @@ def run_upload_pipeline_task(
             report["status"] = "failed"
             report["current_step"] = "Upload / extraction failed"
             report["logs"] = list(report.get("logs", [])) + [f"CRITICAL ERROR: {exc}"]
+
+
+@app.post("/api/ingest-sec")
+async def ingest_sec_filing(
+    background_tasks: BackgroundTasks,
+    company_name: str = Form(...),
+    user_query: Optional[str] = Form(""),
+):
+    """
+    Fetch the latest 10-K from SEC EDGAR for a company and run the analysis pipeline.
+    """
+    company = (company_name or "").strip()
+    if not company:
+        raise HTTPException(status_code=400, detail="company_name is required.")
+
+    query_guard = guardrails.check_upload_query(user_query or "")
+    _guard_or_http(query_guard)
+
+    filing = financial_scraper.fetch_sec_filing(company, "10-K")
+    if not filing.get("success") or len(str(filing.get("text") or "").strip()) < 100:
+        detail = filing.get("error") or "Could not retrieve a usable 10-K from SEC EDGAR."
+        raise HTTPException(status_code=502, detail=detail)
+
+    raw_text = str(filing["text"])
+    ticker = str(filing.get("company") or company)
+    report_id = str(uuid.uuid4())
+    filename = f"{ticker}_10K_SEC.pdf"
+
+    REPORTS_DB[report_id] = {
+        "id": report_id,
+        "filename": filename,
+        "company_name": company,
+        "status": "queued",
+        "current_step": "SEC filing retrieved — queued for analysis",
+        "logs": [
+            f"SEC EDGAR 10-K retrieved for {company} ({ticker}).",
+            f"Source: {filing.get('source', 'SEC EDGAR')}.",
+            f"Extracted {len(raw_text):,} characters from filing.",
+            "Pipeline will start shortly (poll this report for live logs).",
+        ],
+        "result": None,
+    }
+
+    background_tasks.add_task(
+        run_agent_pipeline_task,
+        report_id,
+        raw_text,
+        company,
+        user_query or "",
+    )
+
+    return {
+        "success": True,
+        "report_id": report_id,
+        "company_name": company,
+        "status": "queued",
+        "source": filing.get("source"),
+    }
 
 
 @app.post("/api/upload")
@@ -370,8 +438,8 @@ async def trigger_analysis(req: TriggerRequest, background_tasks: BackgroundTask
 @app.post("/api/chat")
 async def chatbot_query(req: ChatRequest):
     """
-    RAG chat: standard citation Q&A, or on-demand peer comparison (scrape → validate → SLM)
-    when the user asks to compare against a competitor in natural language.
+    LLM-driven chat agent: THINK → Action → Observe loop with tools
+    (RAG retrieve, report summary, SEC/web scrape, comparative SLM).
     """
     report_id = req.report_id
     if report_id not in REPORTS_DB:
@@ -384,40 +452,15 @@ async def chatbot_query(req: ChatRequest):
         return payload
 
     safe_message = chat_guard.sanitized_text or req.message
-
     report = REPORTS_DB[report_id]
-    company = report["company_name"]
-    result = report.get("result") or {}
-    filing_excerpt = ""
-    sections = result.get("sections") or {}
-    if isinstance(sections, dict) and sections:
-        filing_excerpt = "\n".join(str(v) for v in sections.values() if v)[:8000]
-    else:
-        filing_excerpt = str(result.get("raw_text") or "")[:8000]
 
-    if is_comparison_query(safe_message, filing_excerpt):
-        if not result:
-            raise HTTPException(
-                status_code=400,
-                detail="Report analysis is not ready yet. Wait for the pipeline to finish.",
-            )
-        comparison_res = run_chat_peer_comparison(report, safe_message)
-        if comparison_res.get("handled"):
-            if comparison_res.get("answer"):
-                out_guard = guardrails.check_llm_text_output(comparison_res["answer"])
-                if not out_guard.allowed:
-                    blocked = out_guard.to_api_payload()
-                    blocked["mode"] = "comparison"
-                    return blocked
-                comparison_res = {
-                    **comparison_res,
-                    "answer": out_guard.sanitized_text or comparison_res["answer"],
-                }
-            return comparison_res
+    if not report.get("result"):
+        raise HTTPException(
+            status_code=400,
+            detail="Report analysis is not ready yet. Wait for the pipeline to finish.",
+        )
 
-    chatbot_res = rag_chatbot.query_chatbot(safe_message, company)
-    chatbot_res["mode"] = "rag"
-    return chatbot_res
+    return run_chat_agent(report, safe_message)
 
 if __name__ == "__main__":
     import uvicorn

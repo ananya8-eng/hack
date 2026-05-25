@@ -1,125 +1,256 @@
 @import "tailwindcss";
 
 :root {
-  --background: #060814;
-  --foreground: #f8fafc;
-  --card-bg: rgba(13, 17, 39, 0.7);
-  --border-color: rgba(99, 102, 241, 0.15);
-  --primary-glow: radial-gradient(circle, rgba(99, 102, 241, 0.15) 0%, rgba(168, 85, 247, 0.05) 50%, transparent 100%);
+  /* Dark Mode: neutral console base with nature accents */
+  --bg-primary: #0a0f0a;
+  --bg-surface: #132A13;
+  --bg-elevated: #1e3a1e;
+  --bg-card: rgba(19, 42, 19, 0.76);
+  --border-color: rgba(144, 169, 85, 0.20);
+  --border-subtle: rgba(144, 169, 85, 0.09);
+  
+  --foreground: #ECF39E;
+  --text-primary: #ECF39E;
+  --text-secondary: #90A955;
+  --text-muted: rgba(144, 169, 85, 0.72);
+  --text-subtle: rgba(144, 169, 85, 0.52);
+  --brand-palm: #90A955;
+  --brand-lime: #ECF39E;
+  --accent-data: #90A955;
+  --accent-audit: #4F772D;
+  --accent-chat: #ECF39E;
+  --accent-benchmark: #31572C;
+}
+
+.light {
+  /* Light Mode: Nature / Sage Theme */
+  --bg-primary: #f8fbf4;      /* Soft Lime Cream tint */
+  --bg-surface: #ffffff;      
+  --bg-elevated: #f0f5e6;     
+  --bg-card: rgba(255, 255, 255, 0.95);
+  --border-color: rgba(49, 87, 44, 0.15); /* Hunter Green border */
+  --border-subtle: rgba(49, 87, 44, 0.06); 
+  
+  --foreground: #132A13;      /* Evergreen text */
+  --text-primary: #132A13;
+  --text-secondary: #31572C;  /* Hunter Green */
+  /* Adjusted light theme font color for improved readability */
+  --foreground: #0f172a;      /* Dark slate for better contrast */
+  --text-primary: #0f172a;
+  --text-muted: rgba(15, 23, 42, 0.75); /* darker muted for readability */
+  --text-subtle: rgba(15, 23, 42, 0.6);
 }
 
 @theme inline {
-  --color-background: var(--background);
+  --color-background: var(--bg-primary);
   --color-foreground: var(--foreground);
-  --font-sans: 'Outfit', 'Inter', sans-serif;
+  --font-sans: 'Inter', var(--font-geist-sans), sans-serif;
+  --font-mono: var(--font-geist-mono), monospace;
+  
+  /* Custom Theme Colors provided by user */
+  --color-green-evergreen: #132A13;
+  --color-green-hunter: #31572C;
+  --color-green-ferns: #4F772D;
+  --color-green-palm: #90A955;
+  --color-green-lime: #ECF39E;
 }
 
 body {
-  background-color: var(--background);
+  background-color: var(--bg-primary);
   background-image: 
-    radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.08) 0px, transparent 50%),
-    radial-gradient(at 100% 0%, rgba(168, 85, 247, 0.08) 0px, transparent 50%),
-    radial-gradient(at 50% 100%, rgba(59, 130, 246, 0.05) 0px, transparent 50%);
+    radial-gradient(at 20% 0%, rgba(144, 169, 85, 0.08) 0px, transparent 46%),
+    radial-gradient(at 86% 6%, rgba(49, 87, 44, 0.08) 0px, transparent 42%),
+    radial-gradient(at 50% 100%, rgba(144, 169, 85, 0.05) 0px, transparent 48%);
   color: var(--foreground);
   font-family: var(--font-sans);
   overflow-x: hidden;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
-/* Beautiful custom scrollbar */
+.light body {
+  background-image: 
+    radial-gradient(at 50% 0%, rgba(49, 87, 44, 0.03) 0px, transparent 50%),
+    radial-gradient(at 100% 0%, rgba(19, 42, 19, 0.02) 0px, transparent 50%);
+}
+
+/* Ensure form controls and placeholders use accessible contrast in light mode */
+.light input,
+.light textarea,
+.light select,
+.light button {
+  color: var(--text-primary);
+}
+
+.light ::placeholder {
+  color: rgba(15, 23, 42, 0.55);
+  opacity: 1;
+}
+
+/* Scrollbar - Clean and minimal */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: rgba(13, 17, 39, 0.5);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(99, 102, 241, 0.3);
-  border-radius: 4px;
+  background: rgba(144, 169, 85, 0.28);
+  border-radius: 10px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(99, 102, 241, 0.5);
+  background: rgba(144, 169, 85, 0.42);
 }
 
-/* Micro-animations and utility classes */
-@keyframes pulse-glow {
-  0%, 100% {
-    opacity: 0.6;
-    box-shadow: 0 0 15px rgba(99, 102, 241, 0.2);
-  }
-  50% {
-    opacity: 1;
-    box-shadow: 0 0 25px rgba(99, 102, 241, 0.4);
-  }
+.light ::-webkit-scrollbar-thumb {
+  background: rgba(49, 87, 44, 0.2);
 }
 
-.pulse-glow-border {
-  animation: pulse-glow 3s infinite;
+.light ::-webkit-scrollbar-thumb:hover {
+  background: rgba(49, 87, 44, 0.35);
 }
 
+/* Glass Panels */
 .glass-panel {
-  background: var(--card-bg);
-  backdrop-filter: blur(16px);
+  background: var(--bg-card);
+  backdrop-filter: blur(12px);
   border: 1px solid var(--border-color);
   border-radius: 12px;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2), 0 2px 4px -2px rgba(0, 0, 0, 0.2);
+  transition: all 0.2s ease;
+}
+
+.light .glass-panel {
+  box-shadow: 0 2px 8px -2px rgba(49, 87, 44, 0.05), 0 4px 16px -4px rgba(49, 87, 44, 0.03);
 }
 
 .glass-panel:hover {
-  border-color: rgba(99, 102, 241, 0.3);
-  box-shadow: 0 10px 30px -10px rgba(99, 102, 241, 0.15);
+  border-color: rgba(144, 169, 85, 0.30);
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.2), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
 }
 
-.neon-text-blue {
-  text-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
+.light .glass-panel:hover {
+  border-color: rgba(49, 87, 44, 0.25);
+  box-shadow: 0 10px 25px -5px rgba(49, 87, 44, 0.08);
 }
 
-.neon-text-indigo {
-  text-shadow: 0 0 10px rgba(99, 102, 241, 0.5);
-}
-
-.neon-text-violet {
-  text-shadow: 0 0 10px rgba(168, 85, 247, 0.5);
-}
-
-/* Hide default input outline but add glowing focus */
-.glow-focus:focus {
-  outline: none;
-  border-color: rgba(99, 102, 241, 0.5);
-  box-shadow: 0 0 15px rgba(99, 102, 241, 0.25);
-}
-
-/* Custom highlight class for filing viewer */
+/* Highlights */
 .highlight-risk {
-  background-color: rgba(239, 68, 68, 0.2);
-  border-bottom: 2px dashed rgba(239, 68, 68, 0.6);
-  padding: 1px 2px;
+  background-color: rgba(239, 68, 68, 0.15);
+  border-bottom: 2px solid rgba(239, 68, 68, 0.4);
+  padding: 0px 2px;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.2s ease;
+  border-radius: 2px;
 }
 
 .highlight-risk:hover {
-  background-color: rgba(239, 68, 68, 0.35);
+  background-color: rgba(239, 68, 68, 0.25);
 }
 
 .highlight-competitor {
-  background-color: rgba(59, 130, 246, 0.18);
-  border-bottom: 2px dashed rgba(59, 130, 246, 0.5);
-  padding: 1px 2px;
+  background-color: rgba(79, 119, 45, 0.20);
+  border-bottom: 2px solid rgba(79, 119, 45, 0.55);
+  padding: 0px 2px;
+  border-radius: 2px;
 }
 
 .highlight-supply {
   background-color: rgba(245, 158, 11, 0.18);
-  border-bottom: 2px dashed rgba(245, 158, 11, 0.5);
-  padding: 1px 2px;
+  border-bottom: 2px solid rgba(245, 158, 11, 0.55);
+  padding: 0px 2px;
+  border-radius: 2px;
 }
 
 .highlight-active {
-  background-color: rgba(168, 85, 247, 0.35) !important;
-  border-bottom: 2px solid rgb(168, 85, 247) !important;
-  box-shadow: 0 0 8px rgba(168, 85, 247, 0.4);
+  background-color: rgba(239, 68, 68, 0.25) !important;
+  border-bottom: 2px solid #ef4444 !important;
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.2);
 }
+
+*:focus-visible {
+  outline: 2px solid var(--accent-data);
+  outline-offset: 2px;
+}
+
+@keyframes loading-progress {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+.animate-gradient-strip {
+  background: linear-gradient(90deg, #90A955, #31572C, #90A955, #90A955);
+  background-size: 300% 300%;
+  animation: loading-progress 3s ease infinite;
+}
+
+/* Typography utilities for markdown */
+.prose-custom p {
+  margin-bottom: 0.75em;
+}
+.prose-custom p:last-child {
+  margin-bottom: 0;
+}
+.prose-custom ul {
+  list-style-type: disc;
+  padding-left: 1.5em;
+  margin-bottom: 0.75em;
+}
+.prose-custom strong {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.prose-custom table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.prose-custom thead th {
+  background: rgba(144, 169, 85, 0.12);
+  color: var(--text-primary);
+  font-weight: 600;
+  text-align: left;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  white-space: nowrap;
+}
+
+.prose-custom tbody td {
+  padding: 0.45rem 0.65rem;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  vertical-align: top;
+}
+
+.prose-custom tbody tr:nth-child(even) {
+  background: rgba(148, 163, 184, 0.06);
+}
+
+.prose-custom pre {
+  overflow-x: auto;
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  background: rgba(15, 23, 42, 0.04);
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+
+.dark .prose-custom pre {
+  background: rgba(15, 23, 42, 0.5);
+}
+
+.prose-custom .overflow-x-auto {
+  overflow-x: auto;
+}
+

@@ -116,7 +116,56 @@ class FinancialScraper:
 
         return key.upper().replace(" ", "_")[:8]
 
+    def _duckduckgo_lite_results(self, query: str, max_results: int = 5) -> List[Dict[str, str]]:
+        """
+        DuckDuckGo Lite returns parseable snippets + links (more reliable than html.duckduckgo.com).
+        """
+        headers = {"User-Agent": self._user_agent}
+        try:
+            response = requests.post(
+                "https://lite.duckduckgo.com/lite/",
+                data={"q": query},
+                headers=headers,
+                timeout=15,
+            )
+            response.raise_for_status()
+        except Exception as e:
+            logger.warning("DuckDuckGo Lite search failed: %s", e)
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        snippets = [
+            td.get_text(" ", strip=True)
+            for td in soup.select("td.result-snippet")
+            if td.get_text(strip=True)
+        ]
+        links = []
+        for anchor in soup.select("a.result-link"):
+            href = str(anchor.get("href") or "").strip()
+            title = anchor.get_text(" ", strip=True)
+            if href.startswith("http"):
+                links.append({"url": href, "title": title})
+
+        results: List[Dict[str, str]] = []
+        for i in range(max(len(snippets), len(links))):
+            if i >= max_results:
+                break
+            entry: Dict[str, str] = {}
+            if i < len(links):
+                entry["url"] = links[i]["url"]
+                entry["title"] = links[i].get("title") or ""
+            if i < len(snippets):
+                entry["snippet"] = snippets[i]
+            if entry:
+                results.append(entry)
+        return results
+
     def _duckduckgo_result_urls(self, query: str, max_results: int = 3) -> List[str]:
+        lite = self._duckduckgo_lite_results(query, max_results=max_results)
+        urls = [r["url"] for r in lite if r.get("url")]
+        if urls:
+            return urls
+
         search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
         headers = {"User-Agent": self._user_agent}
         try:
@@ -127,7 +176,7 @@ class FinancialScraper:
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
-        urls: List[str] = []
+        urls = []
         for link in soup.select("a.result__a"):
             href = link.get("href", "")
             if not href:
@@ -143,36 +192,52 @@ class FinancialScraper:
                 break
         return urls
 
-    def web_search(self, query: str, company: str = "", max_results: int = 3) -> dict:
+    def web_search(self, query: str, company: str = "", max_results: int = 5) -> dict:
         """
-        Run a natural-language web search, scrape top result pages, and return combined text.
-        Example query: "what is google's top 5 competitors?"
+        Web search via DuckDuckGo Lite snippets (+ optional page scrape).
+        Returns combined snippet text even when target sites block scraping.
         """
         logger.info("Web search: %s", query[:120])
-        urls = self._duckduckgo_result_urls(query, max_results=max_results)
-        if not urls:
+        lite_results = self._duckduckgo_lite_results(query, max_results=max_results)
+
+        parts: List[str] = []
+        used_urls: List[str] = []
+        for i, row in enumerate(lite_results, start=1):
+            title = row.get("title") or f"Result {i}"
+            snippet = row.get("snippet") or ""
+            url = row.get("url") or ""
+            block = f"--- Result {i}: {title} ---"
+            if url:
+                block += f"\nURL: {url}"
+                used_urls.append(url)
+            if snippet:
+                block += f"\n{snippet}"
+            if len(block.strip()) > 40:
+                parts.append(block)
+
+        # Enrich with first scrapeable page when snippets alone are thin
+        if sum(len(p) for p in parts) < 400:
+            for url in used_urls[:2]:
+                page_text = self.scrape_url(url)
+                if len(page_text.strip()) >= 200:
+                    parts.append(f"--- Scraped page: {url} ---\n{page_text[:6000]}")
+                    break
+
+        combined = "\n\n".join(parts).strip()
+        label = (company or "EXTERNAL").upper().strip() or "EXTERNAL"
+        if not combined:
             return {
                 "success": False,
                 "source": f"Web Search (no results): {query[:80]}",
                 "text": "",
-                "company": (company or "EXTERNAL").upper(),
+                "company": label,
                 "filing_type": "WEB",
                 "search_query": query,
+                "error": "No search snippets or pages returned",
             }
 
-        parts: List[str] = []
-        used_urls: List[str] = []
-        for url in urls:
-            page_text = self.scrape_url(url)
-            if len(page_text.strip()) < 200:
-                continue
-            parts.append(f"--- Source: {url} ---\n{page_text[:6000]}")
-            used_urls.append(url)
-
-        combined = "\n\n".join(parts)
-        label = (company or "EXTERNAL").upper().strip() or "EXTERNAL"
         return {
-            "success": bool(combined.strip()),
+            "success": True,
             "source": f"Web Search ({query[:60]})",
             "text": combined[:18000],
             "company": label,
@@ -263,6 +328,87 @@ class FinancialScraper:
             "resolved_ticker": ticker,
             "input_company": company,
         }
+
+    def _read_filing_text_from_dir(self, selected_dir: str, max_chars: int) -> str:
+        for root, _, files in os.walk(selected_dir):
+            for fname in files:
+                if not fname.endswith((".txt", ".html")):
+                    continue
+                path = os.path.join(root, fname)
+                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                    raw = fh.read()
+                if fname.endswith(".html"):
+                    text = BeautifulSoup(raw, "html.parser").get_text()
+                else:
+                    text = raw
+                return " ".join(text.split())[:max_chars]
+        return ""
+
+    def fetch_sec_filings_multi(
+        self,
+        company: str,
+        filing_type: str = "10-K",
+        limit: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """Download up to `limit` recent SEC filings and return text + inferred fiscal year."""
+        ticker = self.resolve_ticker(company)
+        actual_upper = (filing_type or "10-K").upper().strip() or "10-K"
+        cap = max(1, min(int(limit), 8))
+        logger.info("Fetching %s x%d for margin trends: %s (%s)", actual_upper, cap, company, ticker)
+
+        try:
+            from sec_edgar_downloader import Downloader
+
+            dl = Downloader(
+                self._sec_company,
+                self._sec_email,
+                self.download_dir,
+            )
+            count = dl.get(actual_upper.replace("-PRIOR", ""), ticker, limit=cap)
+            if count <= 0:
+                return []
+
+            base = os.path.join(
+                self.download_dir, "sec-edgar-filings", ticker, actual_upper.replace("-PRIOR", "")
+            )
+            if not os.path.isdir(base):
+                return []
+
+            subdirs = sorted(
+                os.path.join(base, d)
+                for d in os.listdir(base)
+                if os.path.isdir(os.path.join(base, d))
+            )
+            selected = subdirs[-cap:]
+            results: List[Dict[str, Any]] = []
+            for selected_dir in selected:
+                accession = os.path.basename(selected_dir)
+                text = self._read_filing_text_from_dir(selected_dir, 50000)
+                if not text:
+                    continue
+                from backend.extraction.margin_trends import (
+                    extract_fiscal_year,
+                    year_from_accession_dir,
+                )
+
+                fiscal_year = year_from_accession_dir(accession) or extract_fiscal_year(text)
+                results.append(
+                    {
+                        "success": True,
+                        "source": f"SEC EDGAR ({ticker} {actual_upper} {accession})",
+                        "text": text,
+                        "company": company,
+                        "ticker": ticker,
+                        "filing_type": actual_upper,
+                        "year": fiscal_year,
+                        "accession": accession,
+                    }
+                )
+            logger.info("Retrieved %s historical filing(s) for %s", len(results), ticker)
+            return results
+        except Exception as e:
+            logger.warning("Multi-year SEC fetch failed for %s: %s", ticker, e)
+            return []
 
     def execute_scrape_request(self, request: Dict[str, Any]) -> dict:
         """Run one LLM-planned scrape request (web search, SEC filing, or prior filing)."""

@@ -37,25 +37,26 @@ class ValidatorAgent:
                 )
             plan_summary = "\n".join(plan_lines)
 
-        prompt = f"""
-        [System] You are an elite AI Financial Compliance and Validator Agent.
-        Audit this scraped document to verify it is authentic, recent, and highly relevant.
-        
+        from backend.agents.slm_system_prompts import SlmRole, compose_slm_prompt
+
+        task_body = f"""
+        [User query context] Validate scraped content for target company analysis.
+
         [Target Profile]
         Target Company: {target_company}
         Allowed Competitors/Peers: {", ".join(target_competitors)}
         Agent Scrape Plan:
         {plan_summary or "N/A"}
         Web Search Query (if any): {search_query or "N/A"}
-        
-        [Scraped Document Metadata]
+
+        [Scraped Document Metadata — sec_edgar or web_search tool output]
         Source: {source}
         Declared Company: {scraped_company}
         Filing Type: {filing_type}
-        
+
         [Content Snippet]
         {text[:2000]}
-        
+
         [Task]
         Return a strict JSON document validating this content. Ensure the keys match exactly:
         {{
@@ -67,6 +68,7 @@ class ValidatorAgent:
             "cleaned_content": "A high-quality extracted text summary, excluding any HTML tags, duplicate headers, or boilerplate legalese."
         }}
         """
+        prompt = compose_slm_prompt(SlmRole.VALIDATOR, task_body)
 
         parsed = llm_client.generate_json(prompt, temperature=0.0)
         if parsed:
